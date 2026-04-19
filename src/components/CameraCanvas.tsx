@@ -37,12 +37,6 @@ export function CameraCanvas({ fpsRef, landmarksRef }: CameraCanvasProps) {
     const compositor = createCompositor(bg, subject);
     const fps = makeFpsTracker();
 
-    // Offscreen canvas used to feed MediaPipe a brightness/contrast-boosted copy of the video.
-    // Helps landmark detection in dim rooms — noisy low-light images make the model's output
-    // jitter. Display still uses the raw video so the user sees themselves naturally.
-    const detectionCanvas = document.createElement('canvas');
-    const detectionCtx = detectionCanvas.getContext('2d', { willReadFrequently: false });
-
     const resize = () => {
       bg.width = window.innerWidth;
       bg.height = window.innerHeight;
@@ -67,21 +61,11 @@ export function CameraCanvas({ fpsRef, landmarksRef }: CameraCanvasProps) {
       // --- Hand landmarks ---
       // rawHandsRef gets MediaPipe's native coords (video-space, non-mirrored) for the compositor.
       // landmarksRef gets the x-mirrored copy for the overlay + gesture machine (viewport-space).
+      // Feeds the raw video frame straight to the landmarker — brightness/contrast preprocessing
+      // was clipping highlights in well-lit rooms and hurting landmark quality more than it helped.
       const landmarker = landmarkerRef.current;
-      if (landmarker && detectionCtx && video.videoWidth && video.videoHeight) {
-        // Preprocess the frame before feeding MediaPipe: brightness 1.25, contrast 1.15. Cheap
-        // enough at 1080p (~2-3ms) and tolerates low-light scenes better.
-        if (
-          detectionCanvas.width !== video.videoWidth ||
-          detectionCanvas.height !== video.videoHeight
-        ) {
-          detectionCanvas.width = video.videoWidth;
-          detectionCanvas.height = video.videoHeight;
-        }
-        detectionCtx.filter = 'brightness(1.25) contrast(1.15) saturate(1.1)';
-        detectionCtx.drawImage(video, 0, 0);
-        detectionCtx.filter = 'none';
-        const result = landmarker.detectForVideo(detectionCanvas, ts);
+      if (landmarker && video.videoWidth && video.videoHeight) {
+        const result = landmarker.detectForVideo(video, ts);
         if (result.landmarks.length) {
           rawHandsRef.current = result.landmarks.map((hand) =>
             hand.map((pt) => ({ x: pt.x, y: pt.y, z: pt.z })),

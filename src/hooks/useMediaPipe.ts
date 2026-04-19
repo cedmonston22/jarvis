@@ -47,12 +47,12 @@ export function useMediaPipe(): UseMediaPipeResult {
             baseOptions: { modelAssetPath: HAND_MODEL, delegate: 'GPU' },
             runningMode: 'VIDEO',
             numHands: 2,
-            // Very permissive gates so hands at distance (small in frame) are still picked up.
-            // Tradeoff: occasional phantom landmarks on skin-toned objects; the gesture state
-            // machine smooths these out via hysteresis + the one-euro filter.
-            minHandDetectionConfidence: 0.15,
-            minHandPresenceConfidence: 0.15,
-            minTrackingConfidence: 0.15,
+            // Near MediaPipe defaults. Cleaner landmarks at normal ranges (cost: a hand very far
+            // from the camera or partially out of frame may drop tracking instead of returning
+            // low-quality landmarks — the gesture layer's hand-lost grace handles that).
+            minHandDetectionConfidence: 0.5,
+            minHandPresenceConfidence: 0.5,
+            minTrackingConfidence: 0.5,
           }),
         ]);
         if (cancelled) {

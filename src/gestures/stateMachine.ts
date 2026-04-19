@@ -33,6 +33,10 @@ import type { GestureEvent } from './bus';
 export interface Tuning {
   pinchIn: number;          // pinchDist threshold to enter PINCH_PENDING
   pinchOut: number;         // pinchDist threshold to leave PINCH_DOWN/DRAGGING (hysteresis gap)
+  // Consecutive frames pinchDist must stay above pinchOut before we fire release. Filters single-
+  // frame noise spikes during fast drag motion without forcing a wider threshold (which makes
+  // release feel sticky). 2 frames at 30fps ≈ 66ms of lag on a real release — imperceptible.
+  pinchReleaseHoldFrames: number;
   pinchFreezeFrames: number;// frames to latch cursor before emitting pinch:down
   dragThreshold: number;    // normalized midpoint travel that promotes PINCH_DOWN → DRAGGING
   pointingMinFrames: number;// pointing must be stable this long before entering POINTING
@@ -44,8 +48,9 @@ export interface Tuning {
 }
 
 export const DEFAULT_TUNING: Tuning = {
-  pinchIn: 0.55,   // covers the noisy front-facing range (0.18–0.65); open hand reads ~1.4
-  pinchOut: 0.95,  // wide hysteresis: fast motion / rotation won't flip release accidentally
+  pinchIn: 0.35,   // tips close but not literal contact — leaves headroom for landmark noise
+  pinchOut: 0.60,  // gap of 0.25 above pinchIn; combined with pinchReleaseHoldFrames ignores drag-flutter spikes
+  pinchReleaseHoldFrames: 2,   // 2-frame hold above pinchOut filters drag-flutter spikes
   pinchFreezeFrames: 4,
   dragThreshold: 0.04,
   pointingMinFrames: 2,
@@ -79,6 +84,9 @@ export interface State {
   // EMA-smoothed pinch distance. Used for all pinch threshold checks so single-frame noise
   // spikes (common at distance where MediaPipe landmarks are less stable) don't flip mode.
   smoothedPinchDist: number;
+  // Consecutive frames where pinchDist has been above pinchOut while in PINCH_DOWN/DRAGGING.
+  // Release fires once this reaches pinchReleaseHoldFrames; resets to 0 below pinchOut.
+  pinchReleaseStreak: number;
 }
 
 export function createInitialState(): State {
@@ -95,6 +103,7 @@ export function createInitialState(): State {
     prevSpread: null,
     lostFrames: 0,
     smoothedPinchDist: 1,
+    pinchReleaseStreak: 0,
   };
 }
 
@@ -172,16 +181,27 @@ export function reduce(
   let frozenCursor = prev.frozenCursor;
   let pinchFreezeRemaining = prev.pinchFreezeRemaining;
   let pinchRefMidpoint = prev.pinchRefMidpoint;
+  let pinchReleaseStreak = prev.pinchReleaseStreak;
   let outCursor = smoothedCursor;
 
   // --- mode transitions ---
   switch (prev.mode) {
     case 'IDLE': {
-      if (pointingStreak >= tuning.pointingMinFrames) {
-        mode = 'POINTING';
-        events.push({ type: 'pointer:move', x: smoothedCursor.x, y: smoothedCursor.y });
-      } else if (zoomStreak >= tuning.zoomMinFrames) {
+      // Cursor follows the fingertip even in IDLE — hover on targets should work regardless of
+      // whether the user has adopted a formal pointing pose.
+      events.push({ type: 'pointer:move', x: smoothedCursor.x, y: smoothedCursor.y });
+      if (zoomStreak >= tuning.zoomMinFrames) {
         mode = 'ZOOMING';
+      } else if (pinchDist < tuning.pinchIn) {
+        // Pinch is independent of the pointing pose. A hand showing thumb+index close enough
+        // counts, even if middle/ring/pinky are also extended or the index is partly bent.
+        mode = 'PINCH_PENDING';
+        frozenCursor = { ...smoothedCursor };
+        pinchFreezeRemaining = tuning.pinchFreezeFrames;
+        pinchRefMidpoint = midpoint;
+        outCursor = frozenCursor;
+      } else if (pointingStreak >= tuning.pointingMinFrames) {
+        mode = 'POINTING';
       }
       break;
     }
@@ -229,13 +249,16 @@ export function reduce(
     }
     case 'PINCH_DOWN': {
       outCursor = frozenCursor ?? smoothedCursor;
-      if (pinchDist > tuning.pinchOut) {
+      const releaseStreak = pinchDist > tuning.pinchOut ? prev.pinchReleaseStreak + 1 : 0;
+      if (releaseStreak >= tuning.pinchReleaseHoldFrames) {
         events.push({ type: 'pinch:up', x: outCursor.x, y: outCursor.y });
         mode = pointerPose ? 'POINTING' : 'IDLE';
         frozenCursor = null;
         pinchRefMidpoint = null;
+        pinchReleaseStreak = 0;
         break;
       }
+      pinchReleaseStreak = releaseStreak;
       // Promote to drag once midpoint has travelled > threshold.
       if (pinchRefMidpoint) {
         const travel = Math.hypot(midpoint.x - pinchRefMidpoint.x, midpoint.y - pinchRefMidpoint.y);
@@ -257,12 +280,15 @@ export function reduce(
             y: base.y + (midpoint.y - ref.y) * frame.viewport.height,
           }
         : smoothedCursor;
-      if (pinchDist > tuning.pinchOut) {
+      const releaseStreak = pinchDist > tuning.pinchOut ? prev.pinchReleaseStreak + 1 : 0;
+      if (releaseStreak >= tuning.pinchReleaseHoldFrames) {
         events.push({ type: 'drag:end', x: outCursor.x, y: outCursor.y });
         mode = pointerPose ? 'POINTING' : 'IDLE';
         frozenCursor = null;
         pinchRefMidpoint = null;
+        pinchReleaseStreak = 0;
       } else {
+        pinchReleaseStreak = releaseStreak;
         events.push({ type: 'drag:move', x: outCursor.x, y: outCursor.y });
       }
       break;
@@ -296,6 +322,7 @@ export function reduce(
       prevSpread: spread,
       lostFrames: 0,
       smoothedPinchDist,
+      pinchReleaseStreak,
     },
     events,
   };

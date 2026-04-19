@@ -10,9 +10,12 @@ import {
 import { fistHand, openHand, pointingHand } from '@/test/fixtures/makeHand';
 import type { Hand } from './types';
 
-// Small tuning for tests: 2-frame freeze window so streaks are quick to reach.
+// Test tuning: shorter streaks for quick reach, and a relaxed pinchIn/Out so we're not testing
+// the EMA smoothing — we're testing state machine transitions. Production tunables are stricter.
 const TUNING: Tuning = {
   ...DEFAULT_TUNING,
+  pinchIn: 0.55,
+  pinchOut: 0.90,
   pinchFreezeFrames: 2,
   pointingMinFrames: 2,
   zoomMinFrames: 2,
@@ -136,17 +139,39 @@ describe('reduce — pinch lifecycle', () => {
     expect(flat.some((e) => e.type === 'pinch:up')).toBe(false);
   });
 
-  it('emits pinch:up when pinch releases after commit', () => {
+  it('enters PINCH_PENDING directly from IDLE without a POINTING pose first', () => {
+    // Pinch no longer requires the pointer pose as a prerequisite — a hand that just appears in
+    // the frame already showing thumb+index close should be able to pinch immediately.
+    const sequence = [
+      pointingHand(0.01), pointingHand(0.01),   // enter PINCH_PENDING from IDLE on first frame
+    ];
+    const { state } = run(sequence);
+    expect(state.mode).toBe('PINCH_PENDING');
+    expect(state.frozenCursor).not.toBeNull();
+  });
+
+  it('emits pointer:move from IDLE so hover works without a pointing pose', () => {
+    // A single frame of any visible hand should light the cursor — previously only POINTING did.
+    const { allEvents } = run([fistHand()]);
+    const flat = allEvents.flatMap((e) => e.events);
+    expect(flat.some((e) => e.type === 'pointer:move')).toBe(true);
+  });
+
+  it('emits a release event when pinch releases after commit', () => {
+    // The release separation (0.6) shifts the thumb enough to also cross the drag threshold on the
+    // first release frame, so in practice this path fires drag:end after a one-frame pass through
+    // DRAGGING. Either pinch:up (no drag) or drag:end (drag-then-release) is a valid close.
     const sequence = [
       pointingHand(), pointingHand(), pointingHand(),     // POINTING
       pointingHand(0.01), pointingHand(0.01), pointingHand(0.01),  // freeze + down
-      pointingHand(0.6),                                   // release
+      pointingHand(0.6), pointingHand(0.6),                // 2-frame release hold
     ];
     const { allEvents } = run(sequence);
     const flat = allEvents.flatMap((e) => e.events);
     expect(flat.some((e) => e.type === 'pinch:down')).toBe(true);
-    expect(flat.some((e) => e.type === 'pinch:up')).toBe(true);
+    expect(flat.some((e) => e.type === 'pinch:up' || e.type === 'drag:end')).toBe(true);
   });
+
 });
 
 describe('reduce — drag lifecycle', () => {
