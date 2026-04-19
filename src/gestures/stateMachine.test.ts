@@ -7,7 +7,7 @@ import {
   type Frame,
   type Tuning,
 } from './stateMachine';
-import { fistHand, openHand, pointingHand } from '@/test/fixtures/makeHand';
+import { fistHand, pointingHand } from '@/test/fixtures/makeHand';
 import type { Hand } from './types';
 
 // Test tuning: shorter streaks for quick reach, and a relaxed pinchIn/Out so we're not testing
@@ -18,7 +18,6 @@ const TUNING: Tuning = {
   pinchOut: 0.90,
   pinchFreezeFrames: 2,
   pointingMinFrames: 2,
-  zoomMinFrames: 2,
 };
 
 const VIEWPORT = { width: 1000, height: 1000 };
@@ -192,29 +191,6 @@ describe('reduce — drag lifecycle', () => {
     const r = reduce(state, frame(shifted, 200), TUNING);
     expect(r.state.mode).toBe('DRAGGING');
     expect(r.events.some((e) => e.type === 'drag:start')).toBe(true);
-  });
-});
-
-describe('reduce — zoom gesture', () => {
-  it('enters ZOOMING when all 5 fingers are extended for zoomMinFrames', () => {
-    const { state } = run([openHand(), openHand(), openHand()]);
-    expect(state.mode).toBe('ZOOMING');
-  });
-
-  it('emits zoom:delta when finger spread changes beyond deadband', () => {
-    // openHand(cameraScale, fingerAngleScale). Fan the fingers wider while keeping the hand at
-    // the same camera distance — this changes handSpread and should trigger zoom:delta.
-    let state: State = createInitialState();
-    state = reduce(state, frame(openHand(1, 1.0), 0), TUNING).state;
-    state = reduce(state, frame(openHand(1, 1.0), 33), TUNING).state;
-    state = reduce(state, frame(openHand(1, 1.0), 66), TUNING).state;
-    expect(state.mode).toBe('ZOOMING');
-    const r = reduce(state, frame(openHand(1, 1.4), 99), TUNING);
-    const delta = r.events.find((e) => e.type === 'zoom:delta');
-    expect(delta).toBeDefined();
-    if (delta && delta.type === 'zoom:delta') {
-      expect(Math.abs(delta.delta)).toBeGreaterThan(TUNING.zoomDeadband);
-    }
   });
 });
 

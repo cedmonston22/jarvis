@@ -142,6 +142,20 @@ export function pinchDistance(hand: Hand): number {
   return Math.min(ratio3D, ratio2D);
 }
 
+// Thumb-tip ↔ pinky-tip distance normalized by the middle-finger length (wrist→middle-tip).
+// Measures how WIDE the fingers are fanned out, irrespective of hand distance from the camera.
+// Fingers bunched together reads small; fingers fanned wide apart reads large. Used by the zoom
+// gesture — change in this value per frame is the zoom:delta signal.
+export function fingerSpan(hand: Hand): number {
+  const tipT = hand[FINGERTIPS.thumb];
+  const tipP = hand[FINGERTIPS.pinky];
+  const wrist = hand[WRIST];
+  const tipM = hand[FINGERTIPS.middle];
+  const handScale = dist2d(wrist, tipM);
+  if (handScale < 0.02) return 0; // hand projecting to near-nothing; unreliable
+  return dist2d(tipT, tipP) / handScale;
+}
+
 // Normalized openness of the whole hand. Sum of fingertip-to-wrist distances divided by bbox
 // long-edge. Fist ≈ 2.5-3.0 (tips near wrist), open palm ≈ 5.5-6.5 (tips extended). Used to gate
 // the zoom gesture (requires all 5 fingers extended, which produces a high spread).

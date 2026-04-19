@@ -31,11 +31,15 @@ export function GestureHud({ modeRef, tapStateRef, pinchDistRef, bus }: GestureH
   }, [modeRef, tapStateRef, pinchDistRef]);
 
   useEffect(() => {
-    // Filter continuous streams (pointer:move, drag:move, zoom:delta) so we don't re-render React
-    // 30× per second. Only discrete-moment events land in the log; the mode indicator already
-    // covers continuous states.
+    // Filter continuous streams (pointer:move, drag:move, bimanual:pinch:move) so we don't
+    // re-render React 30× per second. Only discrete-moment events land in the log.
     return bus.subscribe((e) => {
-      if (e.type === 'pointer:move' || e.type === 'drag:move' || e.type === 'zoom:delta') return;
+      if (
+        e.type === 'pointer:move' ||
+        e.type === 'drag:move' ||
+        e.type === 'bimanual:pinch:move' ||
+        e.type === 'hand:pinch:move'
+      ) return;
       setLog((prev) => [formatEvent(e), ...prev].slice(0, 5));
     });
   }, [bus]);
@@ -86,8 +90,18 @@ function formatEvent(e: GestureEvent): string {
       return 'drag:move';
     case 'drag:end':
       return `drag:end @ ${Math.round(e.x)},${Math.round(e.y)}`;
-    case 'zoom:delta':
-      return `zoom Δ${e.delta.toFixed(3)}`;
+    case 'bimanual:pinch:start':
+      return `bimanual:start`;
+    case 'bimanual:pinch:move':
+      return 'bimanual:move';
+    case 'bimanual:pinch:end':
+      return 'bimanual:end';
+    case 'hand:pinch:start':
+      return `hand${e.hand}:pinch:start`;
+    case 'hand:pinch:move':
+      return `hand${e.hand}:pinch:move`;
+    case 'hand:pinch:end':
+      return `hand${e.hand}:pinch:end`;
   }
 }
 
@@ -102,7 +116,5 @@ function modeColor(mode: Mode): string {
     case 'PINCH_DOWN':
     case 'DRAGGING':
       return 'rgba(124,200,255,1)';
-    case 'ZOOMING':
-      return 'rgba(180,255,180,0.95)';
   }
 }

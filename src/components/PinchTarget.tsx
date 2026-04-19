@@ -62,9 +62,25 @@ export function PinchTarget({
       return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
     };
 
-    const release = () => {
-      const { onDragEnd: onEnd } = handlersRef.current;
-      if (draggingRef.current && onEnd) onEnd();
+    // Release is called on pinch:up or drag:end. Three outcomes:
+    //   - Was dragging → fire onDragEnd.
+    //   - Was pressed but never dragged, and release point still over us → treat as a click.
+    //     This makes a quick pinch-and-release function as a click, alongside the finger-curl
+    //     click detector. Two input modalities, same onClick handler.
+    //   - Neither → silent reset.
+    const release = (releaseX?: number, releaseY?: number) => {
+      const h = handlersRef.current;
+      if (draggingRef.current) {
+        h.onDragEnd?.();
+      } else if (
+        pressedRef.current &&
+        h.onClick &&
+        releaseX !== undefined &&
+        releaseY !== undefined &&
+        contains(releaseX, releaseY)
+      ) {
+        h.onClick();
+      }
       draggingRef.current = false;
       pinchStartRef.current = null;
       pressedRef.current = false;
@@ -113,7 +129,7 @@ export function PinchTarget({
         }
         case 'drag:end':
         case 'pinch:up': {
-          if (pressedRef.current || draggingRef.current) release();
+          if (pressedRef.current || draggingRef.current) release(e.x, e.y);
           break;
         }
       }
@@ -132,6 +148,11 @@ export function PinchTarget({
   return (
     <div
       ref={ref}
+      // Marker attribute — lets the window body's scroll handler hit-test via
+      // `document.elementFromPoint(...)` and refuse to pan-scroll when the pinch started on an
+      // interactive target (chip, button, track row). Without it, scrolling would steal drags
+      // that were meant as clicks or drags on the target itself.
+      data-pinch-target="true"
       style={{
         ...style,
         transform: composed,

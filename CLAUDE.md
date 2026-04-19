@@ -31,55 +31,76 @@ Two disjoint data paths that only meet through a gesture event bus:
 ```
 <video> (hidden)
   │ requestVideoFrameCallback loop (src/lib/frameLoop.ts in CameraCanvas)
-  ├─ brightness/contrast preprocess → detection canvas (helps in low light)
-  ├─ HandLandmarker.detectForVideo(detectionCanvas)      → landmarksRef (x-mirrored)
-  │                                                      → rawHandsRef (video-space)
-  ├─ compositor.draw(video, null, rawHands)              → bg canvas (z=0), subject canvas (z=30)
-  │                                                        (subject canvas inert right now — see below)
-  │
-  │ separate RAF loop (src/hooks/useGestures.ts)
-  ├─ stateMachine.reduce(prev, {hand: hands[0], t, viewport}) → events
-  ├─ per-hand airTap.stepTapDetector(straightness, clickOk)    → click events
-  └─ events → GestureBus → PinchTarget subscribers
+  ├─ HandLandmarker.detectForVideo(video)  → landmarksRef (x-mirrored, viewport-space)
+  │                                        → rawHandsRef (video-space, for compositor)
+  └─ compositor.draw(video, null, rawHands) → bg canvas (z=0), subject canvas (z=30, inert)
 
-React tree re-renders only on discrete event subscriptions (hover, press, click, drag).
+separate RAF loop in src/hooks/useGestures.ts, per frame:
+  1. step per-hand airTap + forwardTap click detectors
+  2. reduce(stateMachine, {hand: hands[0], t, viewport, suppressPinch}) on primary hand
+  3. emit click events for any tap that fired
+  4. step per-hand handPinch detectors → emit hand:pinch:* AND bimanual:pinch:* events
+
+React tree re-renders only on discrete event subscriptions (hover, press, click, drag, anchor-lock).
 ```
 
-- **Per-frame data (landmarks, masks, cursor coords, z history) lives in React refs.** Never put it in React state — it will thrash React at 30 fps.
-- **Only discrete gesture events cross the boundary into React.** Event types live in `src/gestures/bus.ts`: `pointer:move`, `click`, `pinch:down`, `pinch:up`, `drag:start`, `drag:move`, `drag:end`, `zoom:delta`.
-- **Bus is distributed via React context** (`GestureBusProvider` in Stage, `useGestureBus` hook). No zustand yet — add it only if a later milestone (window stacking, focus) needs multi-component shared state.
+- **Per-frame data (landmarks, smoothed values, streak counters) lives in React refs.** Never put it in React state — it will thrash React at 30 fps.
+- **Only discrete gesture events cross the boundary into React.** Event types live in `src/gestures/bus.ts`: `pointer:move`, `click`, `pinch:down`, `pinch:up`, `drag:start`, `drag:move`, `drag:end`, `bimanual:pinch:start`, `bimanual:pinch:move`, `bimanual:pinch:end`, `hand:pinch:start`, `hand:pinch:move`, `hand:pinch:end`.
+- **Bus is distributed via React context** (`GestureBusProvider` in Stage, `useGestureBus` hook). Window state lives in a zustand store (`src/stores/windowStore.ts`) — everything else sticks to bus + refs.
 - **Compositor draws to canvas every frame without re-rendering React.**
 
 ### Current pipeline notes (read this before touching camera/compositor)
 
-- **Segmenter is disabled.** `src/components/CameraCanvas.tsx` has the segmenter invocation commented out. Compositor still runs with `blurRadiusPx: 0` and `bgOvershoot: 1.0`, which collapses to "draw mirrored video to bg canvas, subject canvas stays empty". Hand appears *behind* tiles. To re-enable Vision-Pro layering: uncomment the segmenter block and set `blurRadiusPx: 12`. Infrastructure (useMediaPipe's ImageSegmenter, hand-boost, two-canvas setup) is intact.
-- **MediaPipe detection runs on the raw `<video>` directly.** A brightness/contrast preprocess canvas was removed because it clipped highlights in well-lit rooms and degraded landmark quality more than it helped. If low-light tracking becomes an issue, gate any preprocess on a luminance check rather than applying unconditionally.
+- **Segmenter is disabled.** `src/components/CameraCanvas.tsx` has the segmenter invocation commented out. Compositor still runs with `blurRadiusPx: 0` and `bgOvershoot: 1.0`, which collapses to "draw mirrored video to bg canvas, subject canvas stays empty". Hand appears *behind* windows. To re-enable Vision-Pro layering: uncomment the segmenter block and set `blurRadiusPx: 12`. Infrastructure (useMediaPipe's ImageSegmenter, hand-boost, two-canvas setup) is intact.
+- **MediaPipe detection runs on the raw `<video>` directly.** A brightness/contrast preprocess canvas was tried and removed because it clipped highlights in well-lit rooms and degraded landmark quality more than it helped. If low-light tracking becomes an issue, gate any preprocess on a luminance check rather than applying unconditionally.
 
 ## Gesture state machine invariants
 
-States: `IDLE | POINTING | PINCH_PENDING | PINCH_DOWN | DRAGGING | ZOOMING`. Pure reducer `(prev, frame) → { state, events[] }` in `src/gestures/stateMachine.ts`. Click detection is separate — in `src/gestures/detectors/airTap.ts` (filename is legacy; it's a finger-curl detector now, not z-velocity).
+States: `IDLE | POINTING | PINCH_PENDING | PINCH_DOWN | DRAGGING`. Pure reducer `(prev, frame) → { state, events[] }` in `src/gestures/stateMachine.ts`. The reducer is **single-hand** (primary only). Click detection is separate (two detectors, see below). **Zoom and resize are bimanual** — handled outside the state machine in `useGestures` + `WindowManager`.
 
 Non-negotiable rules (break any and gestures feel broken, not just wrong):
 
-- **Freeze cursor on pinch-start.** When entering `PINCH_PENDING`, latch the smoothed cursor position for `pinchFreezeFrames`. Emit `pinch:down` at the latched position, not the live fingertip. Without this every click lands 8–15 px off-target.
-- **Hysteresis between pinch-in and pinch-out.** Current values in `DEFAULT_TUNING` — the #1 feel-tuning knob. Pinch distance uses `min(3D ratio, 2D ratio)` of thumb-tip ↔ index-tip over index-finger-length so both side-facing and front-facing pinches stay stable (one view compensates when the other is unreliable).
-- **Click is finger-curl.** The user flexes the index slightly and re-extends; detector sees a V-shape in 2D-only `fingerStraightness2D`. 2D is deliberate — MediaPipe's z is noisy at distance, and curl happens in the image plane anyway. Clicks are force-suppressed while pinching/dragging (see `useGestures`).
-- **ZOOMING gate on all-5-fingers-extended.** This guarantees zoom can never collide with POINTING (which requires exactly-1 extended).
+- **Pinch is decoupled from POINTING pose.** `IDLE → PINCH_PENDING` fires directly on `pinchDist < pinchIn`, no pose prerequisite. `POINTING` is just a convenience state for cursor emission — it's no longer a gate for pinch. IDLE also emits `pointer:move` every frame a hand is visible so hover works without a formal pointing pose.
+- **Freeze cursor on pinch-start.** On entering `PINCH_PENDING`, latch the smoothed cursor position for `pinchFreezeFrames`. Emit `pinch:down` at the latched position, not the live fingertip. Without this every click lands 8–15 px off-target.
+- **Hysteresis between pinchIn/pinchOut + release-hold streak.** Current values in `DEFAULT_TUNING`. `pinchReleaseStreak` delays `pinch:up`/`drag:end` until pinchDist stays above `pinchOut` for `pinchReleaseHoldFrames` consecutive frames — filters mid-drag jitter without making release feel sticky. Pinch distance uses `min(3D ratio, 2D ratio)` of thumb-tip ↔ index-tip over index-finger-length so both side-facing and front-facing pinches stay stable.
+- **Click has two detectors, both 2D.** `airTap.ts` watches a V-shape in `fingerStraightness2D` (finger-curl click). `forwardTap.ts` watches rapid growth in the hand's 2D bbox diagonal (hand-toward-camera tap). Either firing emits a `click` event. 2D is deliberate — MediaPipe's z is noisy; 2D bbox is also immune to the tilts-as-taps failure mode that killed the original z-velocity detector.
+- **Click / pinch are mutually gated.** `useGestures` suppresses clicks while the primary is `PINCH_*` or `DRAGGING` (force-cooldown). The state machine refuses to enter `PINCH_PENDING` while the primary tap detector's phase is `CURLING` (via `frame.suppressPinch`). Both directions of mutual lock are required to stop either from stealing the other.
+- **PinchTarget: pinch-and-release over a target = click too.** When a pinch on a target releases without ever promoting to a drag, PinchTarget fires `onClick`. Gives pinch as a second click modality alongside the curl / forward-tap detectors.
+- **`isPointerPose` uses 2D, asymmetric thresholds.** `fingerStraightness2D` > 0.3 for index (permissive — bent pinch still counts as pointing); > 0.55 for middle/ring/pinky (strict — so a relaxed neighbor doesn't satisfy "not extended"). z is too noisy front-facing for a 3D pose gate.
 - **Mirror landmarks' x-coords before any viewport mapping.** `x = 1 - x` in CameraCanvas. Forget this and everything is flipped.
-- **Grace windows matter.** `pointerExitFrames` keeps POINTING alive through a brief tilt/stumble; pinch distance is EMA-smoothed inside the state machine so single-frame landmark jitter doesn't flip modes.
+- **Grace windows.** `pointerExitFrames` keeps POINTING alive through a brief tilt/stumble. Pinch distance is EMA-smoothed inside the state machine so single-frame landmark jitter doesn't flip modes.
+
+## Window manager
+
+Windows are stored in a zustand store (`src/stores/windowStore.ts`): `{ windows: Record<id, WindowState>, focusOrder: string[] }`. One window per app (re-opening focuses). `moveWindow` and `resizeWindow` both clamp against an off-screen buffer (`OFFSCREEN_BUFFER = 100`) so the user can always grab a window back.
+
+`WindowManager.tsx` orchestrates all bimanual interaction:
+
+- **Focus follows pinch.** On `pinch:down`, the topmost window under the point is brought to front.
+- **8 grip zones per window** (4 corners + 4 sides, OVERLAPPING): `T/B/L/R` plus `TL/TR/BL/BR`. Zone split is outer-20%/middle-60%/outer-20% on each axis. Corners = outer 20% on BOTH axes; sides = outer 20% on one axis only; middle = zoom zone.
+- **Bimanual mode is decided on `:start` and locked:**
+  - Opposing corners (TL+BR or TR+BL) → `resize-2d`. Aspect preserved; scale = currentDist / initialDist; window scales around its starting center.
+  - Opposing sides (L+R) → `resize-horizontal`. Width only.
+  - Opposing sides (T+B) → `resize-vertical`. Height only.
+  - Middle (no grip match) → `zoom`. Uses `|a.x - b.x|` only (horizontal distance) to drive `window.zoom`.
+  - Anything else (mixed, non-opposing, different windows) → nothing fires.
+- **Live anchor feedback.** `hand:pinch:*` events let `WindowManager` light up individual L-bracket / edge-tick handles the moment a hand is pinching over them — not just when a full bimanual gesture confirms. Users see per-hand commitment before attempting the motion.
+
+App content is rendered inside `AppFrame`, which applies `transform: scale(win.zoom)` so the window chrome stays fixed size while the body scales.
 
 ## Visual feedback conventions
 
 - **The fingertip IS the cursor** — no separate cursor DOM element. Hit-testing uses the fingertip's viewport pixel position from bus events.
 - **Hand overlay** (`src/components/HandOverlay.tsx`) draws skeleton + dots for debugging. Per-landmark EMA smoothing for display only (gesture detectors see the raw landmarks). Toggle with `D` key.
-- **Tile state mapping** (`PinchTarget`): idle → subtle border; hover → blue border + glow; pressed/dragging → bright accent border + fill + stronger glow. Don't scale-down on press (user dislikes it).
-- **Click ripple** — a blue expanding ring at the click point, always on. Fires only on `click` events (gated to POINTING/IDLE mode).
+- **Tile/window state mapping** (`PinchTarget`): idle → subtle border; hover → blue border + glow; pressed/dragging → bright accent border + fill + stronger glow. Don't scale-down on press (user dislikes it).
+- **Click ripple** — blue expanding ring at the click point. Fires only on `click` events.
+- **Grip anchors** (on windows): corner L-brackets and side ticks. Idle = 35% white outline; active = bright accent with drop-shadow glow. When any grip is locked the whole window gains a soft accent ring.
 
 ## MediaPipe asset loading
 
 - Use `@mediapipe/tasks-vision` only. The legacy `@mediapipe/hands` solutions API is deprecated and must not be added.
 - WASM assets are copied from `node_modules/@mediapipe/tasks-vision/wasm/` into `public/mediapipe/wasm/` by `scripts/copy-mediapipe-assets.mjs` (runs on `npm install`). Load via `FilesetResolver.forVisionTasks("/mediapipe/wasm")`. Do not load from jsDelivr — MediaPipe has shipped CDN versions missing the wasm folder (GH issue #5647).
-- Model files (`hand_landmarker.task`, `selfie_multiclass_256x256.tflite`) are downloaded by the same postinstall script into `public/mediapipe/models/`. The whole `public/mediapipe/` directory is gitignored — regenerated on each install. The selfie segmenter model is currently unused (see "pipeline notes" above) but kept for re-enablement.
+- Model files (`hand_landmarker.task`, `selfie_multiclass_256x256.tflite`) are downloaded by the same postinstall script into `public/mediapipe/models/`. The whole `public/mediapipe/` directory is gitignored — regenerated on each install. The selfie segmenter model is currently unused (see "pipeline notes") but kept for re-enablement.
 - `HandLandmarker` config: `runningMode: "VIDEO"`, `numHands: 2`, `delegate: "GPU"`, all three confidence thresholds at `0.5` (MediaPipe default — was 0.15 originally but that returned low-quality landmarks and the gesture layer can't filter noise below the model's confidence).
 
 ## Performance budget (per frame)
@@ -95,22 +116,18 @@ Gesture detectors are pure functions on `Hand` arrays (21-landmark `{x,y,z}`). U
 
 1. In dev, press `Shift+F` to dump the current landmark array to the clipboard as JSON.
 2. Save to `src/test/fixtures/*.json` — one file per pose (static-point, static-fist, mid-pinch, drag-sweep, edge-of-frame, etc.).
-3. Vitest asserts detectors + state-machine transitions against the fixtures (or against `makeHand()` synthetic hands for predictable geometry):
+3. Vitest asserts detectors + state-machine transitions against the fixtures (or against `makeHand()` synthetic hands for predictable geometry).
 
-```ts
-reduce(IDLE, [point, point, pinch, pinch, pinch, release])
-  → emits [pointer:move, ..., pinch:down, pinch:up]
-```
-
-This is the only CI-safe way to prove gesture logic correct. Don't skip it.
+The state-machine tests use a relaxed `pinchIn`/`pinchOut` TUNING (0.55/0.90) rather than prod defaults so they exercise transitions, not the EMA smoothing — see top of `stateMachine.test.ts`.
 
 ## Directory conventions
 
-- `src/gestures/` — pure functions, no DOM, no React, no side effects. Unit-tested. Includes `bus.ts`, `BusContext.tsx`, `useGestureBus.ts`, `stateMachine.ts`, `fingers.ts`, `handTopology.ts`, `oneEuro.ts`, `types.ts`, and `detectors/{pointer,pinch,spread,airTap}.ts`.
+- `src/gestures/` — pure functions, no DOM, no React, no side effects. Unit-tested. Includes `bus.ts`, `BusContext.tsx`, `useGestureBus.ts`, `stateMachine.ts`, `fingers.ts`, `handTopology.ts`, `oneEuro.ts`, `types.ts`, and `detectors/{pointer.ts, airTap.ts, forwardTap.ts, handPinch.ts, spread.ts}`.
 - `src/lib/` — browser primitives (canvas, video frame loop, compositor). No React.
-- `src/hooks/` — React glue that wires `lib/` to components via refs (`useCamera`, `useMediaPipe`, `useGestures`).
-- `src/components/` — presentational. Subscribe to bus events, not whole stores. `PinchTarget` is the reusable hit-testable primitive.
-- `src/apps/` — mock apps (not yet created; M10).
+- `src/hooks/` — React glue (`useCamera`, `useMediaPipe`, `useGestures`).
+- `src/components/` — presentational. Subscribe to bus events. `PinchTarget` is the reusable hit-testable primitive. Window UI lives in `components/window/{WindowManager,Window,AppFrame}.tsx`.
+- `src/stores/` — zustand stores. Currently `windowStore.ts` (window positions, sizes, zoom, focus order).
+- `src/apps/` — mock apps. `registry.ts` exports the `APPS` manifest + `APP_ORDER`; each app has its own folder (e.g. `GoogleMock/index.tsx`). M8 ships with stub components; M10 fleshes them out.
 - `src/test/fixtures/` — hand fixture JSON + `makeHand()` synthetic hand factory.
 - `@/` alias → `src/`. Use it in imports.
 
@@ -118,6 +135,8 @@ This is the only CI-safe way to prove gesture logic correct. Don't skip it.
 
 - Don't install `react-rnd` — its HTML5 mouse model fights the synthetic gesture cursor. Build windows by hand (reuse the `PinchTarget` drag pattern).
 - Don't pipe iframes of Google/Spotify into windows — those sites send `X-Frame-Options: DENY`. Build mock React components for v1; real integrations (Spotify Web Playback SDK, Google Custom Search) land after Supabase auth.
-- Don't revive z-velocity tap detection. User explicitly prefers finger-curl clicks; the previous z-velocity model couldn't distinguish taps from tilts.
+- Don't re-add ZOOMING to the state machine. Zoom is bimanual and lives in `WindowManager`. Single-hand spread-to-zoom was tried multiple ways (continuous, flick-velocity, cumulative-delta) and all tripped on the "fingers return to rest" motion. Bimanual is the resolution.
+- Don't revive the original z-velocity tap detector — the tilts-as-taps failure mode was the whole reason it was scrapped. If "hand toward camera" click accuracy needs work, tune `forwardTap.ts` (bbox-growth-based, 2D, immune to tilts) rather than adding z signals back.
 - Don't re-enable blur/subject-cutout without checking with the user. They turned it off because halos around the hand were visible when it overlapped tiles, and tightening the mask gave jaggy edges. See `feedback_blur_and_subject_cutout_disabled` memory.
-- Don't add heavy smoothing to the gesture signals by default — the user tuned thresholds against the current (moderate) smoothing. Aggressive smoothing breaks click responsiveness.
+- Don't add heavy smoothing to the gesture signals by default — the user tuned thresholds against the current smoothing coefficients. Aggressive smoothing breaks click responsiveness.
+- Don't widen the grip zones past ~20%/60%/20%. Wider outer bands (tried 40% and 30%) make zooms accidentally trip resize when pinching inside a window. 20% bands with live anchor feedback is the current balance.

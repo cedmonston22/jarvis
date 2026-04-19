@@ -9,7 +9,9 @@
 //   PINCH_PENDING  pinch just detected; cursor latched for N frames (kills click-down jitter)
 //   PINCH_DOWN     pinch confirmed after latch window
 //   DRAGGING       pinch held AND hand moved > drag threshold from pinch start
-//   ZOOMING        all 5 fingers extended; emits zoom:delta from spread change
+//
+// Zoom is not a state in this reducer — it's a bimanual gesture handled outside the state
+// machine, in useGestures + WindowManager. Keeps this reducer single-hand by design.
 //
 // Crucial invariant: the cursor emitted during a pinch stays at its `frozenCursor` position even
 // when the user's fingertip drifts during the pinch motion. Without this, every click lands 8–15
@@ -17,7 +19,7 @@
 
 import type { Hand } from './types';
 import { FINGERTIPS } from './handTopology';
-import { fingerExtensions, pinchDistance, handSpread } from './fingers';
+import { pinchDistance } from './fingers';
 import { isPointerPose } from './detectors/pointer';
 import {
   createOneEuroState,
@@ -28,8 +30,6 @@ import {
 } from './oneEuro';
 import type { GestureEvent } from './bus';
 
-// Tunables. Expose as fields of a `Tuning` object so tests can stress edge cases without
-// recompiling. Values match the plan doc.
 export interface Tuning {
   pinchIn: number;          // pinchDist threshold to enter PINCH_PENDING
   pinchOut: number;         // pinchDist threshold to leave PINCH_DOWN/DRAGGING (hysteresis gap)
@@ -41,22 +41,18 @@ export interface Tuning {
   dragThreshold: number;    // normalized midpoint travel that promotes PINCH_DOWN → DRAGGING
   pointingMinFrames: number;// pointing must be stable this long before entering POINTING
   pointerExitFrames: number;// consecutive non-pointer frames required before POINTING → IDLE
-  zoomMinFrames: number;    // all-5 extended must be stable this long before entering ZOOMING
-  zoomDeadband: number;     // spread delta below this is ignored (filters jitter)
   lostGraceFrames: number;  // hand lost this many frames → reset to IDLE
   oneEuro: OneEuroParams;
 }
 
 export const DEFAULT_TUNING: Tuning = {
-  pinchIn: 0.35,   // tips close but not literal contact — leaves headroom for landmark noise
-  pinchOut: 0.60,  // gap of 0.25 above pinchIn; combined with pinchReleaseHoldFrames ignores drag-flutter spikes
-  pinchReleaseHoldFrames: 2,   // 2-frame hold above pinchOut filters drag-flutter spikes
+  pinchIn: 0.35,
+  pinchOut: 0.60,
+  pinchReleaseHoldFrames: 2,
   pinchFreezeFrames: 4,
   dragThreshold: 0.04,
   pointingMinFrames: 2,
   pointerExitFrames: 4,
-  zoomMinFrames: 3,
-  zoomDeadband: 0.02,
   lostGraceFrames: 10,
   oneEuro: DEFAULT_ONE_EURO,
 };
@@ -66,8 +62,7 @@ export type Mode =
   | 'POINTING'
   | 'PINCH_PENDING'
   | 'PINCH_DOWN'
-  | 'DRAGGING'
-  | 'ZOOMING';
+  | 'DRAGGING';
 
 export interface State {
   mode: Mode;
@@ -78,8 +73,6 @@ export interface State {
   pinchRefMidpoint: { x: number; y: number } | null; // pinch-space reference for drag delta
   pointingStreak: number;
   pointerExitStreak: number;  // consecutive non-pointer frames while in POINTING (grace counter)
-  zoomStreak: number;
-  prevSpread: number | null;
   lostFrames: number;
   // EMA-smoothed pinch distance. Used for all pinch threshold checks so single-frame noise
   // spikes (common at distance where MediaPipe landmarks are less stable) don't flip mode.
@@ -99,8 +92,6 @@ export function createInitialState(): State {
     pinchRefMidpoint: null,
     pointingStreak: 0,
     pointerExitStreak: 0,
-    zoomStreak: 0,
-    prevSpread: null,
     lostFrames: 0,
     smoothedPinchDist: 1,
     pinchReleaseStreak: 0,
@@ -111,6 +102,12 @@ export interface Frame {
   hand: Hand | null;
   t: number;                                   // ms timestamp
   viewport: { width: number; height: number }; // for scaling normalized coords to pixels
+  // Set true when the per-hand finger-curl click detector is mid-curl on the primary hand. While
+  // true the state machine refuses to enter PINCH_PENDING, so a click-curl that happens to shorten
+  // thumb↔index distance can never be misread as a pinch. The two detectors already form a mutual
+  // lock: pinch modes suppress click firing (see useGestures), and now click-curl suppresses
+  // pinch entry.
+  suppressPinch?: boolean;
 }
 
 export interface ReduceResult {
@@ -141,7 +138,6 @@ export function reduce(
   }
 
   const hand = frame.hand;
-  const ext = fingerExtensions(hand);
   const rawPinchDist = pinchDistance(hand);
   // Reset smoothing when returning from hand-lost so the blend doesn't chase a stale value.
   const smoothedPinchDist =
@@ -149,7 +145,6 @@ export function reduce(
       ? rawPinchDist
       : 0.6 * rawPinchDist + 0.4 * prev.smoothedPinchDist;
   const pinchDist = smoothedPinchDist;
-  const spread = handSpread(hand);
 
   // Cursor pipeline: index fingertip (already x-mirrored) → viewport pixels → one-euro smoothed.
   const tip = hand[FINGERTIPS.index];
@@ -159,11 +154,10 @@ export function reduce(
   const smoothedCursor = { x: euro.x, y: euro.y };
 
   const pointerPose = isPointerPose(hand);
-  const allFive = ext.every(Boolean);
+  const pinchCandidate = pinchDist < tuning.pinchIn && !frame.suppressPinch;
 
   // Streak counters for pose stability hysteresis.
   const pointingStreak = pointerPose ? prev.pointingStreak + 1 : 0;
-  const zoomStreak = allFive ? prev.zoomStreak + 1 : 0;
   // Non-pointer streak: only accrues while we're already in POINTING, so it acts as a grace
   // counter that delays exit. Any frame with pointer pose resets it.
   const pointerExitStreak =
@@ -190,9 +184,7 @@ export function reduce(
       // Cursor follows the fingertip even in IDLE — hover on targets should work regardless of
       // whether the user has adopted a formal pointing pose.
       events.push({ type: 'pointer:move', x: smoothedCursor.x, y: smoothedCursor.y });
-      if (zoomStreak >= tuning.zoomMinFrames) {
-        mode = 'ZOOMING';
-      } else if (pinchDist < tuning.pinchIn) {
+      if (pinchCandidate) {
         // Pinch is independent of the pointing pose. A hand showing thumb+index close enough
         // counts, even if middle/ring/pinky are also extended or the index is partly bent.
         mode = 'PINCH_PENDING';
@@ -206,12 +198,7 @@ export function reduce(
       break;
     }
     case 'POINTING': {
-      // Pointer -> zoom takes priority over pinch start (all-5 can't coexist with index-only).
-      if (zoomStreak >= tuning.zoomMinFrames) {
-        mode = 'ZOOMING';
-        break;
-      }
-      if (pinchDist < tuning.pinchIn) {
+      if (pinchCandidate) {
         mode = 'PINCH_PENDING';
         frozenCursor = { ...smoothedCursor };
         pinchFreezeRemaining = tuning.pinchFreezeFrames;
@@ -235,8 +222,9 @@ export function reduce(
       // Held cursor, no events, countdown then commit.
       outCursor = frozenCursor ?? smoothedCursor;
       pinchFreezeRemaining -= 1;
-      if (pinchDist > tuning.pinchOut) {
-        // User released before the freeze window finished — cancel without ever emitting down.
+      if (pinchDist > tuning.pinchOut || frame.suppressPinch) {
+        // Released before the freeze window finished, or the click detector decided this is a
+        // curl — cancel without ever emitting pinch:down.
         mode = pointerPose ? 'POINTING' : 'IDLE';
         frozenCursor = null;
         pinchRefMidpoint = null;
@@ -293,19 +281,6 @@ export function reduce(
       }
       break;
     }
-    case 'ZOOMING': {
-      if (!allFive) {
-        mode = pointerPose ? 'POINTING' : 'IDLE';
-        break;
-      }
-      if (prev.prevSpread !== null) {
-        const delta = spread - prev.prevSpread;
-        if (Math.abs(delta) > tuning.zoomDeadband) {
-          events.push({ type: 'zoom:delta', delta });
-        }
-      }
-      break;
-    }
   }
 
   return {
@@ -318,8 +293,6 @@ export function reduce(
       pinchRefMidpoint,
       pointingStreak,
       pointerExitStreak,
-      zoomStreak,
-      prevSpread: spread,
       lostFrames: 0,
       smoothedPinchDist,
       pinchReleaseStreak,

@@ -3,9 +3,11 @@ import { CameraCanvas } from './CameraCanvas';
 import { FpsHud } from './FpsHud';
 import { HandOverlay } from './HandOverlay';
 import { GestureHud } from './GestureHud';
-import { DemoTiles } from './DemoTiles';
+import { WindowManager } from './window/WindowManager';
+import { Dock } from './Dock';
 import { useGestures } from '@/hooks/useGestures';
 import { GestureBusProvider } from '@/gestures/BusContext';
+import { VoiceProvider } from './VoiceController';
 import type { Hands } from '@/gestures/types';
 
 // Top-level container. Owns the per-frame refs that multiple children read from:
@@ -58,19 +60,27 @@ export function Stage() {
 
   return (
     <GestureBusProvider bus={bus}>
-      <div className="relative h-full w-full overflow-hidden">
-        <CameraCanvas fpsRef={fpsRef} landmarksRef={landmarksRef} />
-        <DemoTiles />
-        <HandOverlay landmarksRef={landmarksRef} modeRef={modeRef} visible={showDebug} />
-        <FpsHud fpsRef={fpsRef} />
-        <GestureHud modeRef={modeRef} tapStateRef={tapStateRef} pinchDistRef={pinchDistRef} bus={bus} />
-        <DebugLegend showDebug={showDebug} />
-        {hint && (
-          <div className="pointer-events-none fixed left-1/2 top-3 z-50 -translate-x-1/2 rounded-md border border-jarvis-stroke bg-black/70 px-3 py-1 font-mono text-xs text-jarvis-accent">
-            {hint}
-          </div>
-        )}
-      </div>
+      <VoiceProvider>
+        <div className="relative h-full w-full overflow-hidden">
+          <CameraCanvas fpsRef={fpsRef} landmarksRef={landmarksRef} />
+          <WindowManager />
+          <Dock />
+          <HandOverlay landmarksRef={landmarksRef} modeRef={modeRef} visible={showDebug} />
+          <FpsHud fpsRef={fpsRef} />
+          <GestureHud
+            modeRef={modeRef}
+            tapStateRef={tapStateRef}
+            pinchDistRef={pinchDistRef}
+            bus={bus}
+          />
+          <DebugLegend showDebug={showDebug} />
+          {hint && (
+            <div className="pointer-events-none fixed left-1/2 top-3 z-50 -translate-x-1/2 rounded-md border border-jarvis-stroke bg-black/70 px-3 py-1 font-mono text-xs text-jarvis-accent">
+              {hint}
+            </div>
+          )}
+        </div>
+      </VoiceProvider>
     </GestureBusProvider>
   );
 }

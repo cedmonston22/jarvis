@@ -4,6 +4,11 @@
 // Kept intentionally tiny — one `subscribe(fn)` that returns an unsubscribe function, one
 // `emit(event)`. No priority, no once, no wildcard matching.
 
+export interface BimanualPoint {
+  x: number;
+  y: number;
+}
+
 export type GestureEvent =
   | { type: 'pointer:move'; x: number; y: number }
   | { type: 'click'; x: number; y: number }
@@ -12,7 +17,18 @@ export type GestureEvent =
   | { type: 'drag:start'; x: number; y: number }
   | { type: 'drag:move'; x: number; y: number }
   | { type: 'drag:end'; x: number; y: number }
-  | { type: 'zoom:delta'; delta: number };
+  // Bimanual pinch — fires when both hands are pinching simultaneously. Start captures the
+  // initial pair of midpoints; move updates continuously; end fires when either hand releases.
+  // Used for two-hand zoom (scale windows) and eventually two-corner resize.
+  | { type: 'bimanual:pinch:start'; a: BimanualPoint; b: BimanualPoint }
+  | { type: 'bimanual:pinch:move'; a: BimanualPoint; b: BimanualPoint }
+  | { type: 'bimanual:pinch:end' }
+  // Per-hand pinch state. Fires alongside the bimanual events so consumers can light up
+  // individual anchor visuals as each hand enters / moves / leaves a pinch. `hand` is the
+  // landmark index (0 = primary, 1 = secondary).
+  | { type: 'hand:pinch:start'; hand: number; x: number; y: number }
+  | { type: 'hand:pinch:move'; hand: number; x: number; y: number }
+  | { type: 'hand:pinch:end'; hand: number };
 
 export type GestureListener = (event: GestureEvent) => void;
 
