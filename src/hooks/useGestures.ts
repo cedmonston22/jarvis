@@ -9,7 +9,7 @@ import {
 } from '@/gestures/stateMachine';
 import { createGestureBus, type GestureBus } from '@/gestures/bus';
 import { FINGERTIPS } from '@/gestures/handTopology';
-import { fingerStraightness } from '@/gestures/fingers';
+import { fingerStraightness2D, pinchDistance } from '@/gestures/fingers';
 import {
   createTapState,
   stepTapDetector,
@@ -30,6 +30,8 @@ export interface UseGesturesResult {
   modeRef: React.MutableRefObject<Mode>;
   // Snapshot of the primary-hand tap detector for the debug HUD.
   tapStateRef: React.MutableRefObject<TapState>;
+  // Live pinch-distance reading on the primary hand, for HUD calibration.
+  pinchDistRef: React.MutableRefObject<number>;
 }
 
 // Drives the gesture state machine from the landmarks ref, running at RAF cadence. Emits discrete
@@ -50,6 +52,7 @@ export function useGestures(
   const modeRef = useRef<Mode>('IDLE');
   const tapStatesRef = useRef<TapState[]>([]);
   const primaryTapRef = useRef<TapState>(createTapState());
+  const pinchDistRef = useRef<number>(0);
 
   const tuning = opts.tuning ?? DEFAULT_TUNING;
   const tapTuning = opts.tap ?? DEFAULT_TAP_TUNING;
@@ -70,6 +73,7 @@ export function useGestures(
       );
       stateRef.current = next;
       modeRef.current = next.mode;
+      pinchDistRef.current = primary ? pinchDistance(primary) : 0;
       for (const e of events) bus.emit(e);
 
       // 2. Air-tap detection on every visible hand. A tap fires only when the specific hand is
@@ -82,18 +86,32 @@ export function useGestures(
       } else if (tapStatesRef.current.length > hands.length) {
         tapStatesRef.current.length = hands.length;
       }
+      // Don't fire clicks while the primary hand is pinching / dragging / zooming — the natural
+      // thumb-to-index motion involves a tiny index flex that our sensitive curl threshold would
+      // otherwise read as a click. Only trust clicks when the user is "just pointing".
+      const primaryMode = stateRef.current.mode;
+      const clickOk =
+        primaryMode === 'POINTING' || primaryMode === 'IDLE';
       for (let i = 0; i < hands.length; i++) {
         const hand = hands[i];
-        const straightness = fingerStraightness(hand, 1); // index finger
-        // Allow clicks whenever the index has been mostly extended recently — a very deep curl
-        // during the click will drive straightness below our strict pointer threshold, but we
-        // still want the V-shape to fire. Loose gate here; the tuning thresholds inside the
-        // detector do the heavy lifting.
-        const allow = true;
+        const straightness = fingerStraightness2D(hand, 1); // index finger, image-plane only
+        // While pinching/dragging/zooming, hold the tap detector in full cooldown. This prevents
+        // any finger-curl transient that happens during the pinch from firing a click as soon as
+        // the drag ends.
+        if (!clickOk) {
+          tapStatesRef.current[i] = {
+            phase: 'COOLDOWN',
+            cooldown: tapTuning.cooldownFrames,
+            minStraight: 1,
+            curlFrames: 0,
+          };
+          if (i === 0) primaryTapRef.current = tapStatesRef.current[i];
+          continue;
+        }
         const { state: tapNext, fired } = stepTapDetector(
           tapStatesRef.current[i],
           straightness,
-          allow,
+          clickOk,
           tapTuning,
         );
         tapStatesRef.current[i] = tapNext;
@@ -118,5 +136,5 @@ export function useGestures(
     return () => cancelAnimationFrame(raf);
   }, [landmarksRef, bus, tuning, tapTuning]);
 
-  return { bus, stateRef, modeRef, tapStateRef: primaryTapRef };
+  return { bus, stateRef, modeRef, tapStateRef: primaryTapRef, pinchDistRef };
 }

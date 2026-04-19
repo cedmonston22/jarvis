@@ -65,9 +65,8 @@ const STRAIGHTNESS_THRESHOLD: readonly number[] = [0.3, 0.55, 0.55, 0.55, 0.55];
 // 3D. Uses all three axes so fingers pointed TOWARD the camera (z-forward) still read as extended
 // — a pure 2D distance check collapses in that case and gives false negatives.
 // Cosine of the angle at the finger's mid joint in 3D. 1.0 = perfectly straight, 0 = 90° bend,
-// -1.0 = fully folded back. Finger-curl click detection reads this signal directly — a tap is a
-// V-shape in straightness over a few frames, orthogonal to hand tilts which don't change joint
-// angles.
+// -1.0 = fully folded back. Used for pointer-pose detection so fingers pointed toward the camera
+// still read as extended (z-axis information matters there).
 export function fingerStraightness(hand: Hand, fingerIdx: 0 | 1 | 2 | 3 | 4): number {
   const { base, mid, tip } = FINGER_CHAINS[fingerIdx];
   const b = hand[base];
@@ -79,6 +78,22 @@ export function fingerStraightness(hand: Hand, fingerIdx: 0 | 1 | 2 | 3 | 4): nu
   const mag2 = Math.hypot(v2x, v2y, v2z);
   if (mag1 === 0 || mag2 === 0) return 0;
   return (v1x * v2x + v1y * v2y + v1z * v2z) / (mag1 * mag2);
+}
+
+// 2D-only variant, ignoring the z-axis. MediaPipe's z estimation degrades when the hand is small
+// in the frame (far from camera), but x/y stay accurate. Used by click detection where the curl
+// motion happens in the image plane anyway — more robust at distance.
+export function fingerStraightness2D(hand: Hand, fingerIdx: 0 | 1 | 2 | 3 | 4): number {
+  const { base, mid, tip } = FINGER_CHAINS[fingerIdx];
+  const b = hand[base];
+  const m = hand[mid];
+  const t = hand[tip];
+  const v1x = m.x - b.x, v1y = m.y - b.y;
+  const v2x = t.x - m.x, v2y = t.y - m.y;
+  const mag1 = Math.hypot(v1x, v1y);
+  const mag2 = Math.hypot(v2x, v2y);
+  if (mag1 === 0 || mag2 === 0) return 0;
+  return (v1x * v2x + v1y * v2y) / (mag1 * mag2);
 }
 
 export function isFingerExtended(hand: Hand, fingerIdx: 0 | 1 | 2 | 3 | 4): boolean {
@@ -96,15 +111,35 @@ export function fingerExtensions(hand: Hand): [boolean, boolean, boolean, boolea
   ];
 }
 
-// Normalized thumb-tip ↔ index-tip distance. Divided by hand bbox long-edge so the value is
-// roughly invariant to how close the user is to the camera. Values below ~0.35 are a confident
-// pinch; above ~0.5 is confidently not.
+// Thumb-tip ↔ index-tip distance as a fraction of index-finger length. Computes BOTH the 3D
+// ratio and the 2D ratio and returns the minimum. Rationale:
+//   - Side-facing hand: 3D is stable, 2D foreshortens (unreliable). 3D wins.
+//   - Front-facing hand (palm to camera): MediaPipe's thumb-z gets occluded by the palm and
+//     jumps wildly. 3D ratio becomes noise (observed: 0.1–1.6 on a stable pinch). 2D projection
+//     stays crisp (thumb & index tips really are close in 2D when pinched). 2D wins.
+// Taking min means "if EITHER view agrees the fingers are close, treat as close".
 export function pinchDistance(hand: Hand): number {
   const tipT = hand[FINGERTIPS.thumb];
   const tipI = hand[FINGERTIPS.index];
-  const bbox = handBBox(hand);
-  const scale = Math.max(bbox.width, bbox.height) || 1;
-  return dist2d(tipT, tipI) / scale;
+  const mcpI = hand[5]; // index MCP — finger-length reference
+  const dxTI = tipT.x - tipI.x;
+  const dyTI = tipT.y - tipI.y;
+  const dzTI = tipT.z - tipI.z;
+  const dxIM = tipI.x - mcpI.x;
+  const dyIM = tipI.y - mcpI.y;
+  const dzIM = tipI.z - mcpI.z;
+
+  const fingerLen3D = Math.hypot(dxIM, dyIM, dzIM);
+  const dist3D = Math.hypot(dxTI, dyTI, dzTI);
+  const ratio3D = fingerLen3D > 0 ? dist3D / fingerLen3D : Infinity;
+
+  // Skip the 2D reading if the finger is projecting to near-nothing in 2D (pointed almost
+  // exactly at the camera) — the denominator would be unreliable.
+  const fingerLen2D = Math.hypot(dxIM, dyIM);
+  const dist2D = Math.hypot(dxTI, dyTI);
+  const ratio2D = fingerLen2D > 0.02 ? dist2D / fingerLen2D : Infinity;
+
+  return Math.min(ratio3D, ratio2D);
 }
 
 // Normalized openness of the whole hand. Sum of fingertip-to-wrist distances divided by bbox

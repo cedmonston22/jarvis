@@ -21,7 +21,7 @@ import type { Hands } from '@/gestures/types';
 export function Stage() {
   const fpsRef = useRef(0);
   const landmarksRef = useRef<Hands>([]);
-  const { bus, modeRef, tapStateRef } = useGestures(landmarksRef);
+  const { bus, modeRef, tapStateRef, pinchDistRef } = useGestures(landmarksRef);
 
   const [showDebug, setShowDebug] = useState(true);
   const [hint, setHint] = useState<string | null>(null);
@@ -63,7 +63,7 @@ export function Stage() {
         <DemoTiles />
         <HandOverlay landmarksRef={landmarksRef} modeRef={modeRef} visible={showDebug} />
         <FpsHud fpsRef={fpsRef} />
-        <GestureHud modeRef={modeRef} tapStateRef={tapStateRef} bus={bus} />
+        <GestureHud modeRef={modeRef} tapStateRef={tapStateRef} pinchDistRef={pinchDistRef} bus={bus} />
         <DebugLegend showDebug={showDebug} />
         {hint && (
           <div className="pointer-events-none fixed left-1/2 top-3 z-50 -translate-x-1/2 rounded-md border border-jarvis-stroke bg-black/70 px-3 py-1 font-mono text-xs text-jarvis-accent">

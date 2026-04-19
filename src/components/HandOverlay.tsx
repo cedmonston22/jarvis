@@ -23,9 +23,15 @@ interface Ripple {
   bornAt: number; // performance.now() when the click fired
 }
 
+// Visual smoothing factor for the dots/skeleton. 0..1 — lower = smoother but laggier. Kept
+// display-only so the gesture detectors continue to see unsmoothed landmarks (click/pinch
+// detection depends on sharp transitions).
+const DISPLAY_SMOOTH_ALPHA = 0.55;
+
 export function HandOverlay({ landmarksRef, modeRef, visible }: HandOverlayProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const ripplesRef = useRef<Ripple[]>([]);
+  const smoothedRef = useRef<Hands>([]);
   const bus = useGestureBus();
 
   useEffect(() => {
@@ -56,7 +62,31 @@ export function HandOverlay({ landmarksRef, modeRef, visible }: HandOverlayProps
       const cw = canvas.width;
       const ch = canvas.height;
       ctx.clearRect(0, 0, cw, ch);
-      if (visible) drawHands(ctx, landmarksRef.current, modeRef.current, cw, ch);
+      const raw = landmarksRef.current;
+      // Per-landmark EMA smoothing for display only. Big jumps between frames (hand swaps,
+      // appear/disappear) reset the smoother for that slot so we don't chase a phantom.
+      const smoothed = smoothedRef.current;
+      if (smoothed.length !== raw.length) {
+        smoothedRef.current = raw.map((h) => h.map((p) => ({ ...p })));
+      } else {
+        for (let h = 0; h < raw.length; h++) {
+          for (let i = 0; i < raw[h].length; i++) {
+            const r = raw[h][i];
+            const s = smoothed[h][i];
+            const dx = r.x - s.x;
+            const dy = r.y - s.y;
+            // Reset if the landmark jumped too far in one frame (likely a hand swap).
+            if (Math.hypot(dx, dy) > 0.2) {
+              s.x = r.x; s.y = r.y; s.z = r.z;
+            } else {
+              s.x = DISPLAY_SMOOTH_ALPHA * r.x + (1 - DISPLAY_SMOOTH_ALPHA) * s.x;
+              s.y = DISPLAY_SMOOTH_ALPHA * r.y + (1 - DISPLAY_SMOOTH_ALPHA) * s.y;
+              s.z = DISPLAY_SMOOTH_ALPHA * r.z + (1 - DISPLAY_SMOOTH_ALPHA) * s.z;
+            }
+          }
+        }
+      }
+      if (visible) drawHands(ctx, smoothedRef.current, modeRef.current, cw, ch);
       drawRipples(ctx, ripplesRef.current);
       raf = requestAnimationFrame(tick);
     };
@@ -77,8 +107,9 @@ export function HandOverlay({ landmarksRef, modeRef, visible }: HandOverlayProps
   );
 }
 
-const NON_INDEX_TIPS = new Set<number>([
+const FINGERTIP_IDX = new Set<number>([
   FINGERTIPS.thumb,
+  FINGERTIPS.index,
   FINGERTIPS.middle,
   FINGERTIPS.ring,
   FINGERTIPS.pinky,
@@ -87,13 +118,10 @@ const NON_INDEX_TIPS = new Set<number>([
 function drawHands(
   ctx: CanvasRenderingContext2D,
   hands: Hands,
-  mode: Mode,
+  _mode: Mode,
   cw: number,
   ch: number,
 ): void {
-  const pinchActive = mode === 'PINCH_DOWN' || mode === 'DRAGGING';
-  const pointingActive = mode === 'POINTING' || pinchActive;
-
   for (const hand of hands) {
     // Skeleton lines
     ctx.lineWidth = 2;
@@ -108,62 +136,15 @@ function drawHands(
     }
     ctx.stroke();
 
-    // Non-index landmarks: small muted dots
-    ctx.fillStyle = 'rgba(255, 255, 255, 0.75)';
+    // All landmark dots the same — small white. Gesture state is communicated via the tile
+    // highlight, not the fingertip, so the cursor stays clean.
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.85)';
     for (let i = 0; i < hand.length; i++) {
-      if (i === FINGERTIPS.index) continue;
       const p = hand[i];
       ctx.beginPath();
-      ctx.arc(p.x * cw, p.y * ch, NON_INDEX_TIPS.has(i) ? 4 : 3, 0, Math.PI * 2);
+      ctx.arc(p.x * cw, p.y * ch, FINGERTIP_IDX.has(i) ? 4 : 3, 0, Math.PI * 2);
       ctx.fill();
     }
-
-    // Index fingertip — the "cursor". Color + ring encode gesture mode.
-    const tip = hand[FINGERTIPS.index];
-    const cx = tip.x * cw;
-    const cy = tip.y * ch;
-    drawFingertipCursor(ctx, cx, cy, { pointingActive, pinchActive, zooming: mode === 'ZOOMING' });
-  }
-}
-
-function drawFingertipCursor(
-  ctx: CanvasRenderingContext2D,
-  x: number,
-  y: number,
-  flags: { pointingActive: boolean; pinchActive: boolean; zooming: boolean },
-) {
-  const { pointingActive, pinchActive, zooming } = flags;
-
-  // Outer ring — shows "engaged" (accent) vs "idle" (muted white) and grows on pinch.
-  ctx.beginPath();
-  ctx.lineWidth = pinchActive ? 3 : 2;
-  ctx.strokeStyle = pinchActive
-    ? 'rgba(124, 200, 255, 1)'
-    : pointingActive
-      ? 'rgba(124, 200, 255, 0.85)'
-      : 'rgba(255, 255, 255, 0.5)';
-  const outerR = pinchActive ? 14 : pointingActive ? 11 : 9;
-  ctx.arc(x, y, outerR, 0, Math.PI * 2);
-  ctx.stroke();
-
-  // Inner dot — solid fill on pinch, dot otherwise.
-  ctx.beginPath();
-  ctx.fillStyle = pinchActive
-    ? 'rgba(124, 200, 255, 0.95)'
-    : pointingActive
-      ? 'rgba(124, 200, 255, 0.9)'
-      : 'rgba(255, 255, 255, 0.9)';
-  ctx.arc(x, y, pinchActive ? 7 : 4, 0, Math.PI * 2);
-  ctx.fill();
-
-  if (zooming) {
-    // Pulsing second ring when spreading for zoom.
-    const t = (performance.now() / 400) % 1;
-    ctx.beginPath();
-    ctx.lineWidth = 2;
-    ctx.strokeStyle = `rgba(124, 200, 255, ${0.6 * (1 - t)})`;
-    ctx.arc(x, y, 11 + t * 14, 0, Math.PI * 2);
-    ctx.stroke();
   }
 }
 

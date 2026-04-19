@@ -7,24 +7,51 @@ export interface PinchTargetProps {
   className?: string;
   style?: CSSProperties;
   onClick?: () => void;
+  // Drag hooks. When the user pinches while the fingertip is inside this target and then drags,
+  // onDragStart fires once on drag commit, onDragDelta fires every frame with cumulative (dx, dy)
+  // in viewport px relative to pinch-start, onDragEnd fires on release. Consumer stores the final
+  // offset however it likes.
+  onDragStart?: () => void;
+  onDragDelta?: (dx: number, dy: number) => void;
+  onDragEnd?: () => void;
+  // Live drag offset applied to the element's transform (in viewport px). Combined with the
+  // hover/press scale and any transform in `style`. Callers that don't support drag pass nothing.
+  dragOffset?: { x: number; y: number };
 }
 
-// A hit-testable element that reacts to the fingertip. Subscribes to the gesture bus:
-//   - pointer:move  → hover state if fingertip is inside our rect
-//   - pinch:down   → pressed state if we were being hovered at pinch-start
-//   - pinch:up     → if still pressed, commit onClick, then release
-// Hit-testing uses getBoundingClientRect() fresh on each event so layout changes (resize, scroll,
-// parent transforms) are picked up automatically.
+// Hit-testable element that reacts to the fingertip via bus events.
+//   pointer:move → hover state if fingertip is inside our rect
+//   click        → onClick (from finger-curl detector)
+//   pinch:down  → pressed state (start of a possible drag)
+//   drag:start  → onDragStart (only fires if pinch started over us)
+//   drag:move   → onDragDelta with cumulative offset from pinch-start
+//   pinch:up / drag:end → release + onDragEnd
 //
-// Hover/press are component-local state (not a store) because only this element cares — React's
-// re-render cost is only paid on transition.
-export function PinchTarget({ children, className, style, onClick }: PinchTargetProps) {
+// Callbacks are held in refs so the bus subscription stays stable across renders — consumers can
+// pass inline closures (e.g. that capture drag state) without causing the subscription to churn
+// at 30Hz and drop events.
+export function PinchTarget({
+  children,
+  className,
+  style,
+  onClick,
+  onDragStart,
+  onDragDelta,
+  onDragEnd,
+  dragOffset,
+}: PinchTargetProps) {
   const ref = useRef<HTMLDivElement>(null);
   const hoveredRef = useRef(false);
   const pressedRef = useRef(false);
+  const pinchStartRef = useRef<{ x: number; y: number } | null>(null);
+  const draggingRef = useRef(false);
   const [hovered, setHovered] = useState(false);
   const [pressed, setPressed] = useState(false);
   const bus = useGestureBus();
+
+  // Event-handler refs: updated on every render, read inside the stable subscription.
+  const handlersRef = useRef({ onClick, onDragStart, onDragDelta, onDragEnd });
+  handlersRef.current = { onClick, onDragStart, onDragDelta, onDragEnd };
 
   useEffect(() => {
     const el = ref.current;
@@ -35,56 +62,88 @@ export function PinchTarget({ children, className, style, onClick }: PinchTarget
       return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
     };
 
+    const release = () => {
+      const { onDragEnd: onEnd } = handlersRef.current;
+      if (draggingRef.current && onEnd) onEnd();
+      draggingRef.current = false;
+      pinchStartRef.current = null;
+      pressedRef.current = false;
+      setPressed(false);
+    };
+
     const unsub = bus.subscribe((e) => {
+      const h = handlersRef.current;
       switch (e.type) {
         case 'pointer:move': {
-          const h = contains(e.x, e.y);
-          if (h !== hoveredRef.current) {
-            hoveredRef.current = h;
-            setHovered(h);
+          const over = contains(e.x, e.y);
+          if (over !== hoveredRef.current) {
+            hoveredRef.current = over;
+            setHovered(over);
           }
           break;
         }
         case 'click': {
-          // Air-tap click. Briefly flash the pressed state as visual confirmation, then release.
           if (contains(e.x, e.y)) {
             setPressed(true);
             window.setTimeout(() => setPressed(false), 120);
-            onClick?.();
+            h.onClick?.();
           }
           break;
         }
         case 'pinch:down': {
-          // Pinch initiates a grab (drag) — no click. Still show a pressed visual so the user
-          // knows the system saw their grab attempt.
           if (contains(e.x, e.y)) {
             pressedRef.current = true;
             setPressed(true);
+            pinchStartRef.current = { x: e.x, y: e.y };
           }
           break;
         }
-        case 'pinch:up':
-        case 'drag:end': {
-          if (pressedRef.current) {
-            pressedRef.current = false;
-            setPressed(false);
+        case 'drag:start': {
+          if (pinchStartRef.current) {
+            draggingRef.current = true;
+            h.onDragStart?.();
           }
+          break;
+        }
+        case 'drag:move': {
+          if (draggingRef.current && pinchStartRef.current && h.onDragDelta) {
+            h.onDragDelta(e.x - pinchStartRef.current.x, e.y - pinchStartRef.current.y);
+          }
+          break;
+        }
+        case 'drag:end':
+        case 'pinch:up': {
+          if (pressedRef.current || draggingRef.current) release();
           break;
         }
       }
     });
     return unsub;
-  }, [bus, onClick]);
+  }, [bus]);
+
+  // Compose the final transform. Caller's `style.transform` (typically a centering translate like
+  // `translate(-50%, -50%)`) applies first; drag offset and hover/press scale stack inside it.
+  const scale = hovered || pressed ? 1.04 : 1;
+  const dragTx = dragOffset?.x ?? 0;
+  const dragTy = dragOffset?.y ?? 0;
+  const baseTransform = style?.transform ?? '';
+  const composed = `${baseTransform} translate(${dragTx}px, ${dragTy}px) scale(${scale})`.trim();
 
   return (
     <div
       ref={ref}
-      style={style}
+      style={{
+        ...style,
+        transform: composed,
+        transition: draggingRef.current ? 'none' : 'transform 150ms ease, box-shadow 150ms ease',
+      }}
       className={clsx(
-        'select-none rounded-2xl border transition-[transform,border-color,background-color,box-shadow] duration-150',
+        'select-none rounded-2xl border',
         'border-white/15 bg-white/5 backdrop-blur-md',
-        hovered && !pressed && 'scale-[1.03] border-jarvis-accent/70 bg-white/10 shadow-[0_0_0_2px_rgba(124,200,255,0.25)]',
-        pressed && 'scale-[0.97] border-jarvis-accent bg-jarvis-accent/20',
+        // Both hover and press share the accent glow; press is brighter + thicker border so the
+        // user can clearly see a tile is grabbed.
+        hovered && !pressed && 'border-jarvis-accent/70 bg-white/10 shadow-[0_0_0_2px_rgba(124,200,255,0.25)]',
+        pressed && 'border-jarvis-accent bg-jarvis-accent/25 shadow-[0_0_0_3px_rgba(124,200,255,0.5)]',
         className,
       )}
     >

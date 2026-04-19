@@ -44,8 +44,8 @@ export interface Tuning {
 }
 
 export const DEFAULT_TUNING: Tuning = {
-  pinchIn: 0.35,
-  pinchOut: 0.5,
+  pinchIn: 0.55,   // covers the noisy front-facing range (0.18–0.65); open hand reads ~1.4
+  pinchOut: 0.95,  // wide hysteresis: fast motion / rotation won't flip release accidentally
   pinchFreezeFrames: 4,
   dragThreshold: 0.04,
   pointingMinFrames: 2,
@@ -76,6 +76,9 @@ export interface State {
   zoomStreak: number;
   prevSpread: number | null;
   lostFrames: number;
+  // EMA-smoothed pinch distance. Used for all pinch threshold checks so single-frame noise
+  // spikes (common at distance where MediaPipe landmarks are less stable) don't flip mode.
+  smoothedPinchDist: number;
 }
 
 export function createInitialState(): State {
@@ -91,6 +94,7 @@ export function createInitialState(): State {
     zoomStreak: 0,
     prevSpread: null,
     lostFrames: 0,
+    smoothedPinchDist: 1,
   };
 }
 
@@ -129,7 +133,13 @@ export function reduce(
 
   const hand = frame.hand;
   const ext = fingerExtensions(hand);
-  const pinchDist = pinchDistance(hand);
+  const rawPinchDist = pinchDistance(hand);
+  // Reset smoothing when returning from hand-lost so the blend doesn't chase a stale value.
+  const smoothedPinchDist =
+    prev.lostFrames > 0
+      ? rawPinchDist
+      : 0.6 * rawPinchDist + 0.4 * prev.smoothedPinchDist;
+  const pinchDist = smoothedPinchDist;
   const spread = handSpread(hand);
 
   // Cursor pipeline: index fingertip (already x-mirrored) → viewport pixels → one-euro smoothed.
@@ -285,6 +295,7 @@ export function reduce(
       zoomStreak,
       prevSpread: spread,
       lostFrames: 0,
+      smoothedPinchDist,
     },
     events,
   };

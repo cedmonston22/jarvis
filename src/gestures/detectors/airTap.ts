@@ -34,7 +34,7 @@ export interface TapTuning {
 export const DEFAULT_TAP_TUNING: TapTuning = {
   curlEnter: 0.85,
   curlExit: 0.88,
-  peakRequired: 0.7,  // shallower curl qualifies — needs to dip only ~30% toward bent
+  peakRequired: 0.9,  // any flex past curlEnter effectively qualifies — light taps work
   curlMaxFrames: 10,
   cooldownFrames: 7,  // ~230ms at 30fps — lets the user click rapidly in succession
 };

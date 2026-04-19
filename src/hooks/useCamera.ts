@@ -15,7 +15,7 @@ export interface UseCameraResult {
 // Requests user-facing webcam and attaches the stream to a <video> ref.
 // Caller attaches videoRef to a (hidden) <video> element. We await playback before setting ready.
 export function useCamera(opts: UseCameraOptions = {}): UseCameraResult {
-  const { width = 1280, height = 720, frameRate = 30 } = opts;
+  const { width = 1920, height = 1080, frameRate = 30 } = opts;
   const videoRef = useRef<HTMLVideoElement>(null);
   const [ready, setReady] = useState(false);
   const [error, setError] = useState<string | null>(null);

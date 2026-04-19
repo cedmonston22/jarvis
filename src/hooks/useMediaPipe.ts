@@ -47,13 +47,12 @@ export function useMediaPipe(): UseMediaPipeResult {
             baseOptions: { modelAssetPath: HAND_MODEL, delegate: 'GPU' },
             runningMode: 'VIDEO',
             numHands: 2,
-            // Lower confidence gates so a hand entering the frame is picked up immediately rather
-            // than after several "strongly confident" frames. Tradeoff: slightly noisier landmarks
-            // at frame edges, which the gesture state machine smooths out via hysteresis + the
-            // one-euro filter.
-            minHandDetectionConfidence: 0.3,
-            minHandPresenceConfidence: 0.3,
-            minTrackingConfidence: 0.3,
+            // Very permissive gates so hands at distance (small in frame) are still picked up.
+            // Tradeoff: occasional phantom landmarks on skin-toned objects; the gesture state
+            // machine smooths these out via hysteresis + the one-euro filter.
+            minHandDetectionConfidence: 0.15,
+            minHandPresenceConfidence: 0.15,
+            minTrackingConfidence: 0.15,
           }),
         ]);
         if (cancelled) {

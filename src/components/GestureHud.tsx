@@ -6,16 +6,18 @@ import type { GestureBus, GestureEvent } from '@/gestures/bus';
 export interface GestureHudProps {
   modeRef: React.MutableRefObject<Mode>;
   tapStateRef: React.MutableRefObject<TapState>;
+  pinchDistRef: React.MutableRefObject<number>;
   bus: GestureBus;
 }
 
 // Tiny debug HUD: current mode + last few events + live air-tap signal. Polls refs at 10Hz
 // (cheap) and subscribes to the bus for events. The tap signal helps calibrate the thresholds —
 // if you see vz never going negative during a forward poke, the detector will never fire.
-export function GestureHud({ modeRef, tapStateRef, bus }: GestureHudProps) {
+export function GestureHud({ modeRef, tapStateRef, pinchDistRef, bus }: GestureHudProps) {
   const [mode, setMode] = useState<Mode>('IDLE');
   const [tapPhase, setTapPhase] = useState('IDLE');
   const [minStraight, setMinStraight] = useState(1);
+  const [pinchDist, setPinchDist] = useState(0);
   const [log, setLog] = useState<string[]>([]);
 
   useEffect(() => {
@@ -23,9 +25,10 @@ export function GestureHud({ modeRef, tapStateRef, bus }: GestureHudProps) {
       setMode(modeRef.current);
       setTapPhase(tapStateRef.current.phase);
       setMinStraight(tapStateRef.current.minStraight);
+      setPinchDist(pinchDistRef.current);
     }, 100);
     return () => window.clearInterval(id);
-  }, [modeRef, tapStateRef]);
+  }, [modeRef, tapStateRef, pinchDistRef]);
 
   useEffect(() => {
     // Filter continuous streams (pointer:move, drag:move, zoom:delta) so we don't re-render React
@@ -46,8 +49,13 @@ export function GestureHud({ modeRef, tapStateRef, bus }: GestureHudProps) {
       <div className="mt-1 flex items-center gap-2 text-[10px] text-white/55">
         <span>curl {tapPhase.toLowerCase()}</span>
         <span className="text-white/25">|</span>
-        <span className={minStraight <= 0.55 ? 'text-green-400' : minStraight <= 0.85 ? 'text-amber-300' : 'text-white/40'}>
+        <span className={minStraight <= 0.85 ? 'text-green-400' : 'text-white/40'}>
           min {minStraight.toFixed(2)}
+        </span>
+      </div>
+      <div className="mt-0.5 flex items-center gap-2 text-[10px] text-white/55">
+        <span className={pinchDist < 0.4 ? 'text-green-400' : pinchDist < 0.85 ? 'text-amber-300' : 'text-white/40'}>
+          pinch {pinchDist.toFixed(2)}
         </span>
       </div>
       <div className="mt-1.5 space-y-0.5 text-white/50">
