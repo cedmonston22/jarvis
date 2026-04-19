@@ -1,0 +1,1 @@
+{"root":["./src/app.tsx","./src/main.tsx","./src/components/cameracanvas.tsx","./src/components/fpshud.tsx","./src/components/stage.tsx","./src/hooks/usecamera.ts","./src/hooks/usemediapipe.ts","./src/lib/compositor.ts","./src/lib/frameloop.ts","./src/test/smoke.test.ts","./vite.config.ts"],"version":"5.9.3"}
