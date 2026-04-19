@@ -3,72 +3,81 @@ import { useCamera } from '@/hooks/useCamera';
 import { useMediaPipe } from '@/hooks/useMediaPipe';
 import { startFrameLoop, makeFpsTracker } from '@/lib/frameLoop';
 import { createCompositor, type MaskBuffer } from '@/lib/compositor';
+import type { Hands } from '@/gestures/types';
 
 export interface CameraCanvasProps {
-  fpsRef?: { current: number };
+  fpsRef: React.MutableRefObject<number>;
+  // Output ref — we write detected hand landmarks here each frame. Pre-mirrored (x = 1 - x) so
+  // downstream consumers (overlay, gestures) can treat coords as viewport-space-normalized.
+  landmarksRef: React.MutableRefObject<Hands>;
 }
 
-// Temporal max-decay on the mask: new = max(current, prev * DECAY). Prevents single-frame
-// confidence dropouts (e.g. when a hand suddenly enters the scene) from causing the face to flash
-// transparent. Higher = stickier mask (ghosting); lower = snappier (more flicker). 0.85 ≈ 5 frames.
-const MASK_DECAY = 0.85;
-
 // Drives the full-screen canvas. Pipeline per frame:
-//   1. segmenter.segmentForVideo(video, timestamp) -> confidence mask
-//   2. Apply temporal max-decay, update mask ref
+//   1. segmenter.segmentForVideo -> confidence mask + temporal max-decay -> maskRef
+//   2. landmarker.detectForVideo -> normalized landmarks -> landmarksRef (x-mirrored)
 //   3. compositor.draw(video, mask) -> blurred bg + sharp masked subject
-// Per-frame data (mask, fps) stays in refs so React never re-renders on the hot path.
-export function CameraCanvas({ fpsRef }: CameraCanvasProps) {
+// Per-frame data (mask, landmarks, fps) stays in refs so React never re-renders on the hot path.
+export function CameraCanvas({ fpsRef, landmarksRef }: CameraCanvasProps) {
   const { videoRef, ready: cameraReady, error: cameraError } = useCamera();
-  const { segmenterRef, ready: pipeReady, error: pipeError } = useMediaPipe();
-  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const { segmenterRef, landmarkerRef, ready: pipeReady, error: pipeError } = useMediaPipe();
+  const bgCanvasRef = useRef<HTMLCanvasElement>(null);
+  const subjectCanvasRef = useRef<HTMLCanvasElement>(null);
   const maskRef = useRef<MaskBuffer | null>(null);
+  // Non-mirrored landmarks in video-space — fed to the compositor for mask augmentation so hands
+  // stay sharp regardless of segmenter confidence. Parallels `landmarksRef` which is mirrored.
+  const rawHandsRef = useRef<import('@/gestures/types').Hands>([]);
 
   useEffect(() => {
     if (!cameraReady) return;
     const video = videoRef.current;
-    const canvas = canvasRef.current;
-    if (!video || !canvas) return;
+    const bg = bgCanvasRef.current;
+    const subject = subjectCanvasRef.current;
+    if (!video || !bg || !subject) return;
 
-    const compositor = createCompositor(canvas);
+    const compositor = createCompositor(bg, subject);
     const fps = makeFpsTracker();
-    let decayBuf: Float32Array | null = null;
 
     const resize = () => {
-      canvas.width = window.innerWidth;
-      canvas.height = window.innerHeight;
+      bg.width = window.innerWidth;
+      bg.height = window.innerHeight;
+      subject.width = window.innerWidth;
+      subject.height = window.innerHeight;
     };
     resize();
     window.addEventListener('resize', resize);
 
     const stop = startFrameLoop(video, (dt, now) => {
       fps.sample(dt);
-      if (fpsRef) fpsRef.current = fps.ref.current;
+      fpsRef.current = fps.ref.current;
+      const ts = Math.round(now);
 
-      const segmenter = segmenterRef.current;
-      if (segmenter) {
-        const result = segmenter.segmentForVideo(video, Math.round(now));
-        // Multiclass model: confidenceMasks[0] is the background probability. Person = 1 - bg.
-        const bgMask = result.confidenceMasks?.[0];
-        if (bgMask) {
-          const w = bgMask.width;
-          const h = bgMask.height;
-          const bgSrc = bgMask.getAsFloat32Array();
-          if (!decayBuf || decayBuf.length !== bgSrc.length) {
-            decayBuf = new Float32Array(bgSrc.length);
-          }
-          for (let i = 0; i < bgSrc.length; i++) {
-            const person = 1 - bgSrc[i];
-            const prev = decayBuf[i] * MASK_DECAY;
-            decayBuf[i] = person > prev ? person : prev;
-          }
-          maskRef.current = { data: decayBuf, width: w, height: h };
-          bgMask.close();
+      // Segmentation mask intentionally disabled — bg blur is off and the hand-in-front-of-tiles
+      // behavior was causing visible halos at the cutout edge. When we want blur/AR-layering back,
+      // re-enable this block and the compositor will resume painting the subject canvas.
+      //
+      // const segmenter = segmenterRef.current;
+      // if (segmenter) { ... writes to maskRef.current via decayBuf ... }
+
+      // --- Hand landmarks ---
+      // rawHandsRef gets MediaPipe's native coords (video-space, non-mirrored) for the compositor.
+      // landmarksRef gets the x-mirrored copy for the overlay + gesture machine (viewport-space).
+      const landmarker = landmarkerRef.current;
+      if (landmarker) {
+        const result = landmarker.detectForVideo(video, ts);
+        if (result.landmarks.length) {
+          rawHandsRef.current = result.landmarks.map((hand) =>
+            hand.map((pt) => ({ x: pt.x, y: pt.y, z: pt.z })),
+          );
+          landmarksRef.current = result.landmarks.map((hand) =>
+            hand.map((pt) => ({ x: 1 - pt.x, y: pt.y, z: pt.z })),
+          );
+        } else if (landmarksRef.current.length) {
+          landmarksRef.current = [];
+          rawHandsRef.current = [];
         }
-        result.close();
       }
 
-      compositor.draw(video, maskRef.current);
+      compositor.draw(video, maskRef.current, rawHandsRef.current);
     });
 
     return () => {
@@ -76,9 +85,10 @@ export function CameraCanvas({ fpsRef }: CameraCanvasProps) {
       window.removeEventListener('resize', resize);
       compositor.dispose();
       maskRef.current = null;
-      decayBuf = null;
+      landmarksRef.current = [];
+      rawHandsRef.current = [];
     };
-  }, [cameraReady, videoRef, segmenterRef, fpsRef]);
+  }, [cameraReady, videoRef, segmenterRef, landmarkerRef, fpsRef, landmarksRef]);
 
   const err = cameraError ?? pipeError;
   const loadingLabel = !cameraReady
@@ -90,7 +100,19 @@ export function CameraCanvas({ fpsRef }: CameraCanvasProps) {
   return (
     <>
       <video ref={videoRef} className="hidden" />
-      <canvas ref={canvasRef} className="fixed inset-0 h-full w-full" style={{ zIndex: 0 }} />
+      {/* Blurred background layer — sits behind UI windows (z=0). */}
+      <canvas
+        ref={bgCanvasRef}
+        className="fixed inset-0 h-full w-full"
+        style={{ zIndex: 0 }}
+      />
+      {/* Sharp subject (person + hand) cutout — sits in front of UI windows (z=30) so the
+          user physically occludes floating cards, matching Vision-Pro depth semantics. */}
+      <canvas
+        ref={subjectCanvasRef}
+        className="pointer-events-none fixed inset-0 h-full w-full"
+        style={{ zIndex: 30 }}
+      />
       {err && (
         <div className="absolute left-1/2 top-1/2 z-20 -translate-x-1/2 -translate-y-1/2 rounded-lg border border-red-500/40 bg-red-500/10 p-4 text-sm text-red-200">
           {err}

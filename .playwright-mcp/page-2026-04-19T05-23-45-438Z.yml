@@ -1,0 +1,31 @@
+- generic [ref=e3]:
+  - generic [ref=e5]: requesting camera...
+  - generic:
+    - generic: G
+    - generic: Google
+    - generic: —
+  - generic:
+    - generic: S
+    - generic: Spotify
+    - generic: —
+  - generic:
+    - generic: C
+    - generic: Calendar
+    - generic: —
+  - generic:
+    - generic: "N"
+    - generic: Notes
+    - generic: —
+  - generic: 0 fps
+  - generic:
+    - generic:
+      - generic: IDLE
+    - generic:
+      - generic: tap idle
+      - generic: "|"
+      - generic: vz 0.0000
+      - generic: "|"
+      - generic: peak 0.0000
+    - generic:
+      - generic: no events
+  - generic: D debug on·Shift+F copy landmarks

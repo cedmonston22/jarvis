@@ -5,8 +5,14 @@
 // Uses Canvas2D `ctx.filter = 'blur(Npx)'` for the bg, which is GPU-accelerated via Skia on
 // Chromium. Upgrade to a two-pass WebGL gaussian if perf becomes a bottleneck.
 
+import { HAND_CONNECTIONS } from '@/gestures/handTopology';
+import type { Hands } from '@/gestures/types';
+
 export interface Compositor {
-  draw(video: HTMLVideoElement, mask: MaskBuffer | null): void;
+  // `rawHands` is in non-mirrored video-space (matches mask-canvas coordinates). Painted on top
+  // of the segmenter confidence mask so hands are forced into the sharp foreground even when the
+  // segmenter's body mask loses them (extended arms, back-of-hand views).
+  draw(video: HTMLVideoElement, mask: MaskBuffer | null, rawHands?: Hands): void;
   dispose(): void;
 }
 
@@ -30,34 +36,47 @@ export interface CompositorOptions {
   maskDilatePx?: number;
 }
 
-export function createCompositor(main: HTMLCanvasElement, opts: CompositorOptions = {}): Compositor {
-  const blurRadius = opts.blurRadiusPx ?? 12;
-  const bgOvershoot = opts.bgOvershoot ?? 1.06;
-  const [edgeLo, edgeHi] = opts.maskEdge ?? [0.1, 0.45];
-  const maskDilatePx = opts.maskDilatePx ?? 2;
+// Two-canvas compositor so UI can live BETWEEN the blurred background and the sharp subject
+// cutout (Vision-Pro-style layering: the user's body + hand occlude floating UI windows).
+//
+//   z=0   bgCanvas       — blurred mirrored video (opaque)
+//   z=~   UI windows     — rendered by DOM between the two canvases
+//   z=30  subjectCanvas  — masked sharp user + hand on transparent background
+export function createCompositor(
+  bgCanvas: HTMLCanvasElement,
+  subjectCanvas: HTMLCanvasElement,
+  opts: CompositorOptions = {},
+): Compositor {
+  const blurRadius = opts.blurRadiusPx ?? 0;
+  const bgOvershoot = opts.bgOvershoot ?? 1.0;
+  // Hard-edged mask: with blur disabled, any feathering creates a visible halo when the subject
+  // cutout overlaps a tile. Narrow smoothstep + no dilation gives a near-binary cutout.
+  const [edgeLo, edgeHi] = opts.maskEdge ?? [0.45, 0.55];
+  const maskDilatePx = opts.maskDilatePx ?? 0;
 
-  const mainCtx = main.getContext('2d', { alpha: false });
-  if (!mainCtx) throw new Error('compositor: 2D context unavailable');
-
-  const fg = document.createElement('canvas');
-  const fgCtx = fg.getContext('2d');
-  if (!fgCtx) throw new Error('compositor: fg 2D context unavailable');
+  const bgCtx = bgCanvas.getContext('2d', { alpha: false });
+  if (!bgCtx) throw new Error('compositor: bg 2D context unavailable');
+  const subjectCtx = subjectCanvas.getContext('2d', { alpha: true });
+  if (!subjectCtx) throw new Error('compositor: subject 2D context unavailable');
 
   const maskCanvas = document.createElement('canvas');
   const maskCtx = maskCanvas.getContext('2d');
   if (!maskCtx) throw new Error('compositor: mask 2D context unavailable');
 
-  const draw: Compositor['draw'] = (video, mask) => {
-    const cw = main.width;
-    const ch = main.height;
+  const draw: Compositor['draw'] = (video, mask, rawHands) => {
+    const cw = bgCanvas.width;
+    const ch = bgCanvas.height;
     if (!video.videoWidth || !video.videoHeight) return;
 
     // 1. Background layer: blurred mirrored video, oversized so blur-edge darkening is off-canvas.
-    mainCtx.save();
-    mainCtx.filter = `blur(${blurRadius}px)`;
-    drawCoverMirrored(mainCtx, video, video.videoWidth, video.videoHeight, cw, ch, bgOvershoot);
-    mainCtx.filter = 'none';
-    mainCtx.restore();
+    bgCtx.save();
+    bgCtx.filter = `blur(${blurRadius}px)`;
+    drawCoverMirrored(bgCtx, video, video.videoWidth, video.videoHeight, cw, ch, bgOvershoot);
+    bgCtx.filter = 'none';
+    bgCtx.restore();
+
+    // Subject canvas must be fully cleared every frame — it has alpha and we don't want ghosts.
+    subjectCtx.clearRect(0, 0, subjectCanvas.width, subjectCanvas.height);
 
     if (!mask) return;
 
@@ -68,32 +87,30 @@ export function createCompositor(main: HTMLCanvasElement, opts: CompositorOption
     }
     paintConfidenceMask(maskCtx, mask, edgeLo, edgeHi);
 
-    // 3. Foreground layer: sharp mirrored video -> mask via destination-in.
+    // 2b. Boost: paint hand skeleton on top of the mask so hands stay sharp even when the
+    // segmenter's body mask drops them. Uses the raw (non-mirrored) landmarks — mask canvas is
+    // in video space, not viewport space.
+    if (rawHands && rawHands.length) {
+      paintHandBoost(maskCtx, rawHands, maskCanvas.width, maskCanvas.height);
+    }
+
+    // 3. Subject canvas: sharp mirrored video -> mask via destination-in.
     //    Mask is drawn with a small blur(dilate) + contrast boost which together act as a cheap
     //    morphological dilation, fattening thin parts (fingers) that the 256x256 mask undersamples.
-    if (fg.width !== cw || fg.height !== ch) {
-      fg.width = cw;
-      fg.height = ch;
-    }
-    fgCtx.clearRect(0, 0, cw, ch);
-    drawCoverMirrored(fgCtx, video, video.videoWidth, video.videoHeight, cw, ch, 1);
-    fgCtx.globalCompositeOperation = 'destination-in';
-    fgCtx.save();
+    drawCoverMirrored(subjectCtx, video, video.videoWidth, video.videoHeight, cw, ch, 1);
+    subjectCtx.globalCompositeOperation = 'destination-in';
+    subjectCtx.save();
     if (maskDilatePx > 0) {
-      fgCtx.filter = `blur(${maskDilatePx}px) contrast(400%)`;
+      subjectCtx.filter = `blur(${maskDilatePx}px) contrast(400%)`;
     }
-    drawCoverMirrored(fgCtx, maskCanvas, mask.width, mask.height, cw, ch, 1);
-    fgCtx.restore();
-    fgCtx.globalCompositeOperation = 'source-over';
-
-    // 4. Stack the masked sharp layer over the blurred background.
-    mainCtx.drawImage(fg, 0, 0);
+    drawCoverMirrored(subjectCtx, maskCanvas, mask.width, mask.height, cw, ch, 1);
+    subjectCtx.restore();
+    subjectCtx.globalCompositeOperation = 'source-over';
   };
 
   return {
     draw,
     dispose() {
-      fg.width = fg.height = 0;
       maskCanvas.width = maskCanvas.height = 0;
     },
   };
@@ -122,6 +139,47 @@ function paintConfidenceMask(
     out[p + 3] = Math.round(s * 255);
   }
   ctx.putImageData(img, 0, 0);
+}
+
+// Paints a hand-shaped white blob onto the mask canvas: dots at each landmark plus thick strokes
+// along the MediaPipe skeleton. The existing mask dilation pass (blur + contrast) smooths these
+// into a connected hand region, guaranteeing the hand lands in the sharp foreground layer even
+// when the segmenter's confidence is weak there (extended arms, back-of-hand, fast motion).
+function paintHandBoost(
+  ctx: CanvasRenderingContext2D,
+  hands: Hands,
+  maskW: number,
+  maskH: number,
+): void {
+  ctx.save();
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.strokeStyle = 'rgba(255,255,255,1)';
+  ctx.fillStyle = 'rgba(255,255,255,1)';
+  // Normalized stroke/dot radius — tuned so the halo is wider than a finger at typical hand
+  // sizes (mask is usually 256x256; 6 px ≈ a finger's thickness in that resolution).
+  const lineWidth = Math.max(3, Math.round(maskW * 0.03));
+  const dotRadius = Math.max(2, Math.round(maskW * 0.025));
+  ctx.lineWidth = lineWidth;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+
+  for (const hand of hands) {
+    ctx.beginPath();
+    for (const [a, b] of HAND_CONNECTIONS) {
+      const pa = hand[a];
+      const pb = hand[b];
+      if (!pa || !pb) continue;
+      ctx.moveTo(pa.x * maskW, pa.y * maskH);
+      ctx.lineTo(pb.x * maskW, pb.y * maskH);
+    }
+    ctx.stroke();
+    for (const pt of hand) {
+      ctx.beginPath();
+      ctx.arc(pt.x * maskW, pt.y * maskH, dotRadius, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+  ctx.restore();
 }
 
 // Cover-fit draw with horizontal mirror. Crops source to match canvas aspect, then centers.
