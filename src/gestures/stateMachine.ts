@@ -46,7 +46,11 @@ export interface Tuning {
 }
 
 export const DEFAULT_TUNING: Tuning = {
-  pinchIn: 0.35,
+  // pinchIn bumped 0.35 → 0.45 after fixture-driven calibration: real pinches (including the
+  // front-facing case that had been silently failing) land in the 0.16–0.44 range; fist reads
+  // 0.55 as the closest negative, leaving 0.10 of headroom. Prior 0.35 forced users to pinch
+  // harder than natural for front-facing palms.
+  pinchIn: 0.45,
   pinchOut: 0.60,
   pinchReleaseHoldFrames: 2,
   pinchFreezeFrames: 4,
@@ -181,9 +185,13 @@ export function reduce(
   // --- mode transitions ---
   switch (prev.mode) {
     case 'IDLE': {
-      // Cursor follows the fingertip even in IDLE — hover on targets should work regardless of
-      // whether the user has adopted a formal pointing pose.
-      events.push({ type: 'pointer:move', x: smoothedCursor.x, y: smoothedCursor.y });
+      // Cursor is gated on the formal pointing pose (index extended, middle/ring/pinky curled).
+      // Without the gate, any visible hand emits pointer:move — so a wave with an open palm or
+      // fist visually "cursors" onto UI. Gating on isPointerPose kills that false-positive; the
+      // pose check itself examines all four non-thumb fingers (see detectors/pointer.ts).
+      if (pointerPose) {
+        events.push({ type: 'pointer:move', x: smoothedCursor.x, y: smoothedCursor.y });
+      }
       if (pinchCandidate) {
         // Pinch is independent of the pointing pose. A hand showing thumb+index close enough
         // counts, even if middle/ring/pinky are also extended or the index is partly bent.

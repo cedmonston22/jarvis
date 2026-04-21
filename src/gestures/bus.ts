@@ -28,7 +28,13 @@ export type GestureEvent =
   // landmark index (0 = primary, 1 = secondary).
   | { type: 'hand:pinch:start'; hand: number; x: number; y: number }
   | { type: 'hand:pinch:move'; hand: number; x: number; y: number }
-  | { type: 'hand:pinch:end'; hand: number };
+  | { type: 'hand:pinch:end'; hand: number }
+  // Per-hand three-finger pinch (thumb+index+middle). Used for bimanual resize/zoom anchors —
+  // grip handles glow only while this stricter pose is held, so the user sees exactly when a
+  // resize is armed. Midpoint is the centroid of the three tips.
+  | { type: 'hand:triPinch:start'; hand: number; x: number; y: number }
+  | { type: 'hand:triPinch:move'; hand: number; x: number; y: number }
+  | { type: 'hand:triPinch:end'; hand: number };
 
 export type GestureListener = (event: GestureEvent) => void;
 

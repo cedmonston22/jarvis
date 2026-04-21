@@ -112,6 +112,27 @@ export function makeHand(opts: MakeHandOptions = {}): Hand {
 export const pointingHand = (pinchSeparation?: number) =>
   makeHand({ extensions: [false, true, false, false, false], pinchSeparation });
 
+// Claw pose: all fingers curled (none extended), with thumb tip dragged close to the index
+// tip — so thumb/index are geometrically near each other despite no deliberate pinch. This is
+// the false-positive the finger-reach gate rejects.
+export function clawHand(separation: number = 0.015): Hand {
+  const hand = makeHand({ extensions: [false, false, false, false, false] });
+  const indexTip = hand[8];
+  hand[4] = { x: indexTip.x + separation, y: indexTip.y + 0.002, z: 0 };
+  return hand;
+}
+
+// Three-finger pinch: thumb + index + middle tips clustered together. `separation` sets the
+// max pairwise distance between any two of the three tips — pass a small value for a tight
+// tri-pinch, a large value to simulate an open hand.
+export function triPinchHand(separation: number = 0.01): Hand {
+  const hand = makeHand({ extensions: [false, true, true, false, false] });
+  const indexTip = hand[8];
+  hand[4] = { x: indexTip.x + separation, y: indexTip.y + 0.002, z: 0 };
+  hand[12] = { x: indexTip.x - separation, y: indexTip.y + 0.002, z: 0 };
+  return hand;
+}
+
 export const fistHand = () => makeHand({ extensions: [false, false, false, false, false] });
 
 // `cameraScale` simulates moving the hand toward or away from the camera — multiplies all

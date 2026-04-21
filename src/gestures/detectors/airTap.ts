@@ -32,11 +32,14 @@ export interface TapTuning {
 }
 
 export const DEFAULT_TAP_TUNING: TapTuning = {
-  curlEnter: 0.85,
-  curlExit: 0.88,
-  peakRequired: 0.9,  // any flex past curlEnter effectively qualifies — light taps work
+  // Middle-ground: old peakRequired=0.9 fired clicks from ambient finger motion during waving.
+  // peakRequired=0.5 killed normal light taps. 0.75 requires a meaningful dip (index bent past
+  // ~40°) while still accepting quick, non-exaggerated clicks.
+  curlEnter: 0.8,
+  curlExit: 0.84,
+  peakRequired: 0.75,
   curlMaxFrames: 10,
-  cooldownFrames: 7,  // ~230ms at 30fps — lets the user click rapidly in succession
+  cooldownFrames: 7,
 };
 
 export function createTapState(): TapState {

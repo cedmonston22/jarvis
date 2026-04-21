@@ -39,13 +39,15 @@ separate RAF loop in src/hooks/useGestures.ts, per frame:
   1. step per-hand airTap + forwardTap click detectors
   2. reduce(stateMachine, {hand: hands[0], t, viewport, suppressPinch}) on primary hand
   3. emit click events for any tap that fired
-  4. step per-hand handPinch detectors → emit hand:pinch:* AND bimanual:pinch:* events
+  4. step per-hand handPinch detectors (tracks BOTH thumb+index pinch AND thumb+index+middle
+     tri-pinch) → emit hand:pinch:*, hand:triPinch:*, AND bimanual:pinch:* events. Bimanual
+     aggregation is gated on tri-pinch, not regular pinch.
 
 React tree re-renders only on discrete event subscriptions (hover, press, click, drag, anchor-lock).
 ```
 
 - **Per-frame data (landmarks, smoothed values, streak counters) lives in React refs.** Never put it in React state — it will thrash React at 30 fps.
-- **Only discrete gesture events cross the boundary into React.** Event types live in `src/gestures/bus.ts`: `pointer:move`, `click`, `pinch:down`, `pinch:up`, `drag:start`, `drag:move`, `drag:end`, `bimanual:pinch:start`, `bimanual:pinch:move`, `bimanual:pinch:end`, `hand:pinch:start`, `hand:pinch:move`, `hand:pinch:end`.
+- **Only discrete gesture events cross the boundary into React.** Event types live in `src/gestures/bus.ts`: `pointer:move`, `click`, `pinch:down`, `pinch:up`, `drag:start`, `drag:move`, `drag:end`, `bimanual:pinch:start`, `bimanual:pinch:move`, `bimanual:pinch:end`, `hand:pinch:start`, `hand:pinch:move`, `hand:pinch:end`, `hand:triPinch:start`, `hand:triPinch:move`, `hand:triPinch:end`.
 - **Bus is distributed via React context** (`GestureBusProvider` in Stage, `useGestureBus` hook). Window state lives in a zustand store (`src/stores/windowStore.ts`) — everything else sticks to bus + refs.
 - **Compositor draws to canvas every frame without re-rendering React.**
 
@@ -54,15 +56,30 @@ React tree re-renders only on discrete event subscriptions (hover, press, click,
 - **Segmenter is disabled.** `src/components/CameraCanvas.tsx` has the segmenter invocation commented out. Compositor still runs with `blurRadiusPx: 0` and `bgOvershoot: 1.0`, which collapses to "draw mirrored video to bg canvas, subject canvas stays empty". Hand appears *behind* windows. To re-enable Vision-Pro layering: uncomment the segmenter block and set `blurRadiusPx: 12`. Infrastructure (useMediaPipe's ImageSegmenter, hand-boost, two-canvas setup) is intact.
 - **MediaPipe detection runs on the raw `<video>` directly.** A brightness/contrast preprocess canvas was tried and removed because it clipped highlights in well-lit rooms and degraded landmark quality more than it helped. If low-light tracking becomes an issue, gate any preprocess on a luminance check rather than applying unconditionally.
 
+## Gesture grammar: two pinch modalities
+
+The system tracks two distinct pinches per hand. They have **different jobs and never overlap** in product effect:
+
+- **Two-finger pinch** (thumb + index) — `isPinching`, `hand:pinch:*`, and the state-machine's `pinch:down`/`drag:*` events. Used for CLICKING inside app content (PinchTargets like the close button, dock tiles, app buttons) and for the hover cursor. **Never moves or resizes windows.**
+- **Three-finger tri-pinch** (thumb + index + middle) — `isTriPinching`, `hand:triPinch:*`. Used for ALL window-grip interactions, routed in `WindowManager.tsx`:
+  - 1 hand tri-pinching on a T/B/L/R or corner grip zone → **move-single** (drag that window). Middle 60% with one hand = no-op (prevents ambient mid-window drags).
+  - 2 hands on opposing corners / sides → **resize-2d / resize-h / resize-v**
+  - 2 hands on matching zones (both on L, both on TL, etc.) → **move-bimanual** (midpoint-tracked)
+  - 2 hands in middle of same window → **zoom**
+
+The title bar is a passive header — NOT a drag target. The old BR-corner single-hand resize handle has been retired. All window motion flows through tri-pinch.
+
 ## Gesture state machine invariants
 
-States: `IDLE | POINTING | PINCH_PENDING | PINCH_DOWN | DRAGGING`. Pure reducer `(prev, frame) → { state, events[] }` in `src/gestures/stateMachine.ts`. The reducer is **single-hand** (primary only). Click detection is separate (two detectors, see below). **Zoom and resize are bimanual** — handled outside the state machine in `useGestures` + `WindowManager`.
+States: `IDLE | POINTING | PINCH_PENDING | PINCH_DOWN | DRAGGING`. Pure reducer `(prev, frame) → { state, events[] }` in `src/gestures/stateMachine.ts`. The reducer is **single-hand** (primary only) and fires on the two-finger pinch only. Click detection is separate (two detectors, see below). **Zoom, resize, and ALL window movement are tri-pinch** — handled outside the state machine in `useGestures` + `WindowManager`.
 
 Non-negotiable rules (break any and gestures feel broken, not just wrong):
 
-- **Pinch is decoupled from POINTING pose.** `IDLE → PINCH_PENDING` fires directly on `pinchDist < pinchIn`, no pose prerequisite. `POINTING` is just a convenience state for cursor emission — it's no longer a gate for pinch. IDLE also emits `pointer:move` every frame a hand is visible so hover works without a formal pointing pose.
+- **Pinch is decoupled from POINTING pose.** `IDLE → PINCH_PENDING` fires directly on `pinchDist < pinchIn`, no pose prerequisite. `POINTING` is just a convenience state for cursor emission — it's no longer a gate for pinch. IDLE emits `pointer:move` only when `isPointerPose` is true (index extended, middle/ring/pinky curled); without this, waving an open palm or fist cursors onto UI and reads as false pointing.
 - **Freeze cursor on pinch-start.** On entering `PINCH_PENDING`, latch the smoothed cursor position for `pinchFreezeFrames`. Emit `pinch:down` at the latched position, not the live fingertip. Without this every click lands 8–15 px off-target.
 - **Hysteresis between pinchIn/pinchOut + release-hold streak.** Current values in `DEFAULT_TUNING`. `pinchReleaseStreak` delays `pinch:up`/`drag:end` until pinchDist stays above `pinchOut` for `pinchReleaseHoldFrames` consecutive frames — filters mid-drag jitter without making release feel sticky. Pinch distance uses `min(3D ratio, 2D ratio)` of thumb-tip ↔ index-tip over index-finger-length so both side-facing and front-facing pinches stay stable.
+- **Tri-pinch uses max-of-pairwise.** `triPinchDistance` = max of the three pairwise (thumb/index, thumb/middle, index/middle) normalized distances. Taking the MAX means the slowest pair sets the reading — the gesture only reads "pinching" when ALL three tips are actually close. Current thresholds: `triPinchIn 0.40`, `triPinchOut 0.70`. Looser values (0.55/0.90) let relaxed open hands register and caused phantom zooms; tighter (0.30) killed real tri-pinches.
+- **airTap has been retuned for waving tolerance.** `curlEnter 0.8`, `curlExit 0.84`, `peakRequired 0.75`. The original (`0.85/0.88/0.9`) was loose enough that ambient finger flex during hand motion fired clicks. Required curl now equals a real ~40° bend. Don't slip back to the loose values — hand waving will fire clicks again.
 - **Click has two detectors, both 2D.** `airTap.ts` watches a V-shape in `fingerStraightness2D` (finger-curl click). `forwardTap.ts` watches rapid growth in the hand's 2D bbox diagonal (hand-toward-camera tap). Either firing emits a `click` event. 2D is deliberate — MediaPipe's z is noisy; 2D bbox is also immune to the tilts-as-taps failure mode that killed the original z-velocity detector.
 - **Click / pinch are mutually gated.** `useGestures` suppresses clicks while the primary is `PINCH_*` or `DRAGGING` (force-cooldown). The state machine refuses to enter `PINCH_PENDING` while the primary tap detector's phase is `CURLING` (via `frame.suppressPinch`). Both directions of mutual lock are required to stop either from stealing the other.
 - **PinchTarget: pinch-and-release over a target = click too.** When a pinch on a target releases without ever promoting to a drag, PinchTarget fires `onClick`. Gives pinch as a second click modality alongside the curl / forward-tap detectors.
@@ -74,17 +91,20 @@ Non-negotiable rules (break any and gestures feel broken, not just wrong):
 
 Windows are stored in a zustand store (`src/stores/windowStore.ts`): `{ windows: Record<id, WindowState>, focusOrder: string[] }`. One window per app (re-opening focuses). `moveWindow` and `resizeWindow` both clamp against an off-screen buffer (`OFFSCREEN_BUFFER = 100`) so the user can always grab a window back.
 
-`WindowManager.tsx` orchestrates all bimanual interaction:
+`WindowManager.tsx` owns ALL window motion + sizing. Sessions are derived from `hand:triPinch:*` events (NOT `bimanual:pinch:*` — those exist only for the HUD log now).
 
-- **Focus follows pinch.** On `pinch:down`, the topmost window under the point is brought to front.
+- **Focus follows pinch.** On `pinch:down` (two-finger), the topmost window under the point is brought to front. On `hand:triPinch:start`, the window under the first tri-pinching hand is also focused.
 - **8 grip zones per window** (4 corners + 4 sides, OVERLAPPING): `T/B/L/R` plus `TL/TR/BL/BR`. Zone split is outer-20%/middle-60%/outer-20% on each axis. Corners = outer 20% on BOTH axes; sides = outer 20% on one axis only; middle = zoom zone.
-- **Bimanual mode is decided on `:start` and locked:**
-  - Opposing corners (TL+BR or TR+BL) → `resize-2d`. Aspect preserved; scale = currentDist / initialDist; window scales around its starting center.
-  - Opposing sides (L+R) → `resize-horizontal`. Width only.
-  - Opposing sides (T+B) → `resize-vertical`. Height only.
-  - Middle (no grip match) → `zoom`. Uses `|a.x - b.x|` only (horizontal distance) to drive `window.zoom`.
-  - Anything else (mixed, non-opposing, different windows) → nothing fires.
-- **Live anchor feedback.** `hand:pinch:*` events let `WindowManager` light up individual L-bracket / edge-tick handles the moment a hand is pinching over them — not just when a full bimanual gesture confirms. Users see per-hand commitment before attempting the motion.
+- **Session signatures.** A `sessionSignature()` encodes kind + target. Sessions reconcile ONLY when the signature changes (hand joins / leaves / moves between windows) — move events never re-derive, so cached initials stay pinned for smooth deltas. This is how a session latches: once a hand grabs a TL corner, a finger jitter that briefly crosses into the middle band won't abandon the drag.
+- **Session kinds (derived from hand count + zones):**
+  - 1 hand tri-pinching in a grip zone (outer 20% bands) → `move-single`. Middle 60% with one hand → no session (rejected at `sessionSignature`).
+  - 2 hands, opposing corners (TL+BR / TR+BL) → `resize-2d`. Aspect preserved; scale = currentDist / initialDist; window scales around its starting center.
+  - 2 hands, opposing sides (L+R) → `resize-horizontal`. Width only.
+  - 2 hands, opposing sides (T+B) → `resize-vertical`. Height only.
+  - 2 hands, any shared zone (both on L, both on TL, etc.) → `move-bimanual`. Midpoint-tracked drag.
+  - 2 hands in middle (no matching / opposing zones) → `zoom`. Uses `|a.x - b.x|` only (horizontal distance) to drive `window.zoom`.
+  - 2 hands over DIFFERENT windows → nothing fires.
+- **Live anchor feedback.** `hand:triPinch:*` events (not `hand:pinch:*`) drive the grip L-bracket / edge-tick glow. Tied to tri-pinch so users see the window-grip affordance only when they're in the correct pose for it.
 
 App content is rendered inside `AppFrame`, which applies `transform: scale(win.zoom)` so the window chrome stays fixed size while the body scales.
 
@@ -122,7 +142,7 @@ The state-machine tests use a relaxed `pinchIn`/`pinchOut` TUNING (0.55/0.90) ra
 
 ## Directory conventions
 
-- `src/gestures/` — pure functions, no DOM, no React, no side effects. Unit-tested. Includes `bus.ts`, `BusContext.tsx`, `useGestureBus.ts`, `stateMachine.ts`, `fingers.ts`, `handTopology.ts`, `oneEuro.ts`, `types.ts`, and `detectors/{pointer.ts, airTap.ts, forwardTap.ts, handPinch.ts, spread.ts}`.
+- `src/gestures/` — pure functions, no DOM, no React, no side effects. Unit-tested. Includes `bus.ts`, `BusContext.tsx`, `useGestureBus.ts`, `stateMachine.ts`, `fingers.ts` (`pinchDistance`, `triPinchDistance`, straightness helpers), `handTopology.ts`, `oneEuro.ts`, `types.ts`, and `detectors/{pointer.ts, airTap.ts, forwardTap.ts, handPinch.ts, spread.ts}`. `handPinch.ts` tracks both regular pinch and tri-pinch state per hand.
 - `src/lib/` — browser primitives (canvas, video frame loop, compositor). No React.
 - `src/hooks/` — React glue (`useCamera`, `useMediaPipe`, `useGestures`).
 - `src/components/` — presentational. Subscribe to bus events. `PinchTarget` is the reusable hit-testable primitive. Window UI lives in `components/window/{WindowManager,Window,AppFrame}.tsx`.
@@ -135,8 +155,12 @@ The state-machine tests use a relaxed `pinchIn`/`pinchOut` TUNING (0.55/0.90) ra
 
 - Don't install `react-rnd` — its HTML5 mouse model fights the synthetic gesture cursor. Build windows by hand (reuse the `PinchTarget` drag pattern).
 - Don't pipe iframes of Google/Spotify into windows — those sites send `X-Frame-Options: DENY`. Build mock React components for v1; real integrations (Spotify Web Playback SDK, Google Custom Search) land after Supabase auth.
-- Don't re-add ZOOMING to the state machine. Zoom is bimanual and lives in `WindowManager`. Single-hand spread-to-zoom was tried multiple ways (continuous, flick-velocity, cumulative-delta) and all tripped on the "fingers return to rest" motion. Bimanual is the resolution.
+- Don't re-add ZOOMING to the state machine. Zoom is bimanual and lives in `WindowManager`. Single-hand spread-to-zoom was tried multiple ways (continuous, flick-velocity, cumulative-delta) and all tripped on the "fingers return to rest" motion. Bimanual tri-pinch in the middle is the resolution.
 - Don't revive the original z-velocity tap detector — the tilts-as-taps failure mode was the whole reason it was scrapped. If "hand toward camera" click accuracy needs work, tune `forwardTap.ts` (bbox-growth-based, 2D, immune to tilts) rather than adding z signals back.
 - Don't re-enable blur/subject-cutout without checking with the user. They turned it off because halos around the hand were visible when it overlapped tiles, and tightening the mask gave jaggy edges. See `feedback_blur_and_subject_cutout_disabled` memory.
 - Don't add heavy smoothing to the gesture signals by default — the user tuned thresholds against the current smoothing coefficients. Aggressive smoothing breaks click responsiveness.
 - Don't widen the grip zones past ~20%/60%/20%. Wider outer bands (tried 40% and 30%) make zooms accidentally trip resize when pinching inside a window. 20% bands with live anchor feedback is the current balance.
+- Don't make window-level gestures fire on `isPinching` (two-finger). Window move / resize / zoom MUST gate on `isTriPinching` — the three-finger requirement is what stops ambient two-finger pinches from accidentally starting window sessions. Similarly, don't make app-content interactions (PinchTarget, dock tiles) gate on tri-pinch — clicks stay two-finger.
+- Don't restore the title-bar pinch-drag or the BR-corner single-hand resize handle. Both were retired in favor of tri-pinch-only window control. Single-hand move happens via tri-pinch on any grip zone; resize is two-hand tri-pinch on opposing zones.
+- Don't loosen `airTap` (`0.8 / 0.84 / 0.75`) or `handPinch` tri-pinch (`0.40 / 0.70`) thresholds back toward their original values. The original loose settings fired clicks and zooms from ambient hand waving — the current values were specifically tuned to reject that.
+- Don't add a `fingerReach` / "palm-length" gate to pinch detection. It was tried to reject claw poses but also rejected firm deliberate pinches where the index curls inward. Pinch rejection for pathological poses now relies on `pinchDistance`'s own ratio math, not a reach heuristic.

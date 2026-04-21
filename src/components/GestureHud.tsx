@@ -7,17 +7,21 @@ export interface GestureHudProps {
   modeRef: React.MutableRefObject<Mode>;
   tapStateRef: React.MutableRefObject<TapState>;
   pinchDistRef: React.MutableRefObject<number>;
+  lumaRef?: React.MutableRefObject<number>;
+  darkModeRef?: React.MutableRefObject<boolean>;
   bus: GestureBus;
 }
 
 // Tiny debug HUD: current mode + last few events + live air-tap signal. Polls refs at 10Hz
 // (cheap) and subscribes to the bus for events. The tap signal helps calibrate the thresholds —
 // if you see vz never going negative during a forward poke, the detector will never fire.
-export function GestureHud({ modeRef, tapStateRef, pinchDistRef, bus }: GestureHudProps) {
+export function GestureHud({ modeRef, tapStateRef, pinchDistRef, lumaRef, darkModeRef, bus }: GestureHudProps) {
   const [mode, setMode] = useState<Mode>('IDLE');
   const [tapPhase, setTapPhase] = useState('IDLE');
   const [minStraight, setMinStraight] = useState(1);
   const [pinchDist, setPinchDist] = useState(0);
+  const [luma, setLuma] = useState(0.5);
+  const [darkMode, setDarkMode] = useState(false);
   const [log, setLog] = useState<string[]>([]);
 
   useEffect(() => {
@@ -26,9 +30,11 @@ export function GestureHud({ modeRef, tapStateRef, pinchDistRef, bus }: GestureH
       setTapPhase(tapStateRef.current.phase);
       setMinStraight(tapStateRef.current.minStraight);
       setPinchDist(pinchDistRef.current);
+      if (lumaRef) setLuma(lumaRef.current);
+      if (darkModeRef) setDarkMode(darkModeRef.current);
     }, 100);
     return () => window.clearInterval(id);
-  }, [modeRef, tapStateRef, pinchDistRef]);
+  }, [modeRef, tapStateRef, pinchDistRef, lumaRef, darkModeRef]);
 
   useEffect(() => {
     // Filter continuous streams (pointer:move, drag:move, bimanual:pinch:move) so we don't
@@ -38,7 +44,8 @@ export function GestureHud({ modeRef, tapStateRef, pinchDistRef, bus }: GestureH
         e.type === 'pointer:move' ||
         e.type === 'drag:move' ||
         e.type === 'bimanual:pinch:move' ||
-        e.type === 'hand:pinch:move'
+        e.type === 'hand:pinch:move' ||
+        e.type === 'hand:triPinch:move'
       ) return;
       setLog((prev) => [formatEvent(e), ...prev].slice(0, 5));
     });
@@ -60,6 +67,15 @@ export function GestureHud({ modeRef, tapStateRef, pinchDistRef, bus }: GestureH
       <div className="mt-0.5 flex items-center gap-2 text-[10px] text-white/55">
         <span className={pinchDist < 0.4 ? 'text-green-400' : pinchDist < 0.85 ? 'text-amber-300' : 'text-white/40'}>
           pinch {pinchDist.toFixed(2)}
+        </span>
+      </div>
+      <div className="mt-0.5 flex items-center gap-2 text-[10px] text-white/55">
+        <span className={luma < 0.35 ? 'text-amber-300' : 'text-white/40'}>
+          luma {luma.toFixed(2)}
+        </span>
+        <span className="text-white/25">|</span>
+        <span className={darkMode ? 'text-amber-300' : 'text-white/40'}>
+          {darkMode ? 'dark-boost on' : 'dark-boost off'}
         </span>
       </div>
       <div className="mt-1.5 space-y-0.5 text-white/50">
@@ -102,6 +118,12 @@ function formatEvent(e: GestureEvent): string {
       return `hand${e.hand}:pinch:move`;
     case 'hand:pinch:end':
       return `hand${e.hand}:pinch:end`;
+    case 'hand:triPinch:start':
+      return `hand${e.hand}:triPinch:start`;
+    case 'hand:triPinch:move':
+      return `hand${e.hand}:triPinch:move`;
+    case 'hand:triPinch:end':
+      return `hand${e.hand}:triPinch:end`;
   }
 }
 

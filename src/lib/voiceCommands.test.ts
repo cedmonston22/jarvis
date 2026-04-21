@@ -85,6 +85,27 @@ describe('parseCommand', () => {
   it('returns null for "open" without a recognized app', () => {
     expect(parseCommand('open notepad', OPTS)).toBeNull();
   });
+
+  it('parses capture / save / record with a label', () => {
+    expect(parseCommand('capture pinch', OPTS)).toEqual({ type: 'capture', label: 'pinch' });
+    expect(parseCommand('save as fist', OPTS)).toEqual({ type: 'capture', label: 'fist' });
+    expect(parseCommand('record point loose', OPTS)).toEqual({ type: 'capture', label: 'point-loose' });
+  });
+
+  it('sanitizes capture labels (lowercase kebab, strips punctuation)', () => {
+    expect(parseCommand('capture Tri-Pinch, tight!', OPTS)).toEqual({
+      type: 'capture',
+      label: 'tri-pinch-tight',
+    });
+  });
+
+  it('capture wins over close when both words present', () => {
+    // "capture close" could ambiguously match close; first-match ordering on capture protects it.
+    expect(parseCommand('capture close-window-pose', OPTS)).toEqual({
+      type: 'capture',
+      label: 'close-window-pose',
+    });
+  });
 });
 
 describe('fuzzyMatchLabel', () => {

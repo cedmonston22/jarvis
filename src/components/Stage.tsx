@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { CameraCanvas } from './CameraCanvas';
 import { FpsHud } from './FpsHud';
 import { HandOverlay } from './HandOverlay';
@@ -23,16 +23,44 @@ import type { Hands } from '@/gestures/types';
 export function Stage() {
   const fpsRef = useRef(0);
   const landmarksRef = useRef<Hands>([]);
+  const lumaRef = useRef(0.5);
+  const darkModeRef = useRef(false);
   const { bus, modeRef, tapStateRef, pinchDistRef } = useGestures(landmarksRef);
 
   const [showDebug, setShowDebug] = useState(true);
   const [hint, setHint] = useState<string | null>(null);
+
+  const flashHintRef = useRef<(msg: string) => void>(() => {});
+
+  // Voice-driven fixture capture. `label` is already sanitized to kebab-case by the parser, so we
+  // just suffix a timestamp to avoid collisions when iterating on the same pose. Download runs in
+  // the browser — no server write — so the user drops the file into src/test/fixtures/ manually.
+  const handleCapture = useCallback((label: string) => {
+    const hands = landmarksRef.current;
+    if (!hands.length) {
+      flashHintRef.current(`capture "${label}" skipped — no hand visible`);
+      return;
+    }
+    const payload = JSON.stringify(hands, null, 2);
+    const filename = `${label}-${Date.now()}.json`;
+    const blob = new Blob([payload], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    flashHintRef.current(`captured ${hands.length} hand(s) → ${filename}`);
+  }, []);
 
   useEffect(() => {
     const flashHint = (msg: string) => {
       setHint(msg);
       window.setTimeout(() => setHint(null), 1500);
     };
+    flashHintRef.current = flashHint;
     const onKey = async (e: KeyboardEvent) => {
       if (
         e.target instanceof HTMLElement &&
@@ -60,9 +88,14 @@ export function Stage() {
 
   return (
     <GestureBusProvider bus={bus}>
-      <VoiceProvider>
+      <VoiceProvider onCapture={handleCapture}>
         <div className="relative h-full w-full overflow-hidden">
-          <CameraCanvas fpsRef={fpsRef} landmarksRef={landmarksRef} />
+          <CameraCanvas
+            fpsRef={fpsRef}
+            landmarksRef={landmarksRef}
+            lumaRef={lumaRef}
+            darkModeRef={darkModeRef}
+          />
           <WindowManager />
           <Dock />
           <HandOverlay landmarksRef={landmarksRef} modeRef={modeRef} visible={showDebug} />
@@ -71,6 +104,8 @@ export function Stage() {
             modeRef={modeRef}
             tapStateRef={tapStateRef}
             pinchDistRef={pinchDistRef}
+            lumaRef={lumaRef}
+            darkModeRef={darkModeRef}
             bus={bus}
           />
           <DebugLegend showDebug={showDebug} />

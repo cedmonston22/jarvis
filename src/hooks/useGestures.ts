@@ -105,11 +105,14 @@ export function useGestures(
       } else if (forwardTapStatesRef.current.length > hands.length) {
         forwardTapStatesRef.current.length = hands.length;
       }
-      // Emit hand:pinch:end for any hand that disappeared while still pinching, before we
-      // truncate the per-hand state array.
+      // Emit hand:pinch:end / hand:triPinch:end for any hand that disappeared while still
+      // pinching, before we truncate the per-hand state array.
       for (let i = hands.length; i < handPinchStatesRef.current.length; i++) {
         if (handPinchStatesRef.current[i].isPinching) {
           bus.emit({ type: 'hand:pinch:end', hand: i });
+        }
+        if (handPinchStatesRef.current[i].isTriPinching) {
+          bus.emit({ type: 'hand:triPinch:end', hand: i });
         }
       }
       if (handPinchStatesRef.current.length < hands.length) {
@@ -198,9 +201,12 @@ export function useGestures(
       }
 
       // --- Step 4: per-hand pinch tracking. Step each hand's pinch detector, detect
-      // transitions, and emit both per-hand events (for live anchor visuals) and the
-      // aggregated bimanual events (for zoom/resize logic). ---
-      const pinchingPoints: { x: number; y: number }[] = [];
+      // transitions, and emit per-hand events (for live anchor visuals) and the aggregated
+      // bimanual events (for zoom/resize logic). Bimanual requires the STRICTER three-finger
+      // triPinch pose on both hands — differentiates deliberate resize gestures from incidental
+      // two-finger pinches, and stops the bimanual session from getting "stuck" because a
+      // normal thumb+index pinch lingers after the user thinks they released. ---
+      const triPinchingPoints: { x: number; y: number }[] = [];
       for (let i = 0; i < hands.length; i++) {
         const prevState = handPinchStatesRef.current[i];
         const nextState = stepHandPinch(prevState, hands[i], viewport, handPinchTuning);
@@ -212,12 +218,19 @@ export function useGestures(
         } else if (nextState.isPinching) {
           bus.emit({ type: 'hand:pinch:move', hand: i, x: nextState.midpoint.x, y: nextState.midpoint.y });
         }
-        if (nextState.isPinching) pinchingPoints.push(nextState.midpoint);
+        if (!prevState.isTriPinching && nextState.isTriPinching) {
+          bus.emit({ type: 'hand:triPinch:start', hand: i, x: nextState.triMidpoint.x, y: nextState.triMidpoint.y });
+        } else if (prevState.isTriPinching && !nextState.isTriPinching) {
+          bus.emit({ type: 'hand:triPinch:end', hand: i });
+        } else if (nextState.isTriPinching) {
+          bus.emit({ type: 'hand:triPinch:move', hand: i, x: nextState.triMidpoint.x, y: nextState.triMidpoint.y });
+        }
+        if (nextState.isTriPinching) triPinchingPoints.push(nextState.triMidpoint);
       }
-      const bimanualNow = pinchingPoints.length >= 2;
+      const bimanualNow = triPinchingPoints.length >= 2;
       if (bimanualNow) {
-        // Always use the first two pinching hands. If a third joins, ignore it for now.
-        const [a, b] = pinchingPoints;
+        // Always use the first two triPinching hands. If a third joins, ignore it for now.
+        const [a, b] = triPinchingPoints;
         if (!bimanualActiveRef.current) {
           bus.emit({ type: 'bimanual:pinch:start', a, b });
           bimanualActiveRef.current = true;

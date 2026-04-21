@@ -5,16 +5,22 @@
 //   "close" / "close window" / "close the window"       → { type: 'close' }
 //   "search for <query>" / "google <query>" / "look up <query>" / "search <query>"
 //                                                       → { type: 'search', query, matchedLabel }
+//   "capture <label>" / "save <label>" / "record <label>" (also "capture as <label>")
+//                                                       → { type: 'capture', label }
 //
 // Search queries are fuzzy-matched against a caller-supplied list of canned labels
 // (`SUGGESTION_LABELS` in practice) because GoogleMock's results are prebaked — free-form queries
 // still land in the UI but with a "no results" state, which the `matchedLabel: null` signal tells
 // the caller about.
+//
+// `capture` is a developer escape hatch for building hand-pose fixtures — the dispatcher uses the
+// returned label to name a downloaded JSON of current landmarks.
 
 export type VoiceCommand =
   | { type: 'open'; appId: string }
   | { type: 'close' }
-  | { type: 'search'; query: string; matchedLabel: string | null };
+  | { type: 'search'; query: string; matchedLabel: string | null }
+  | { type: 'capture'; label: string };
 
 export interface AppAlias {
   appId: string;
@@ -88,9 +94,28 @@ function matchApp(text: string, apps: readonly AppAlias[]): string | null {
   return null;
 }
 
+function sanitizeLabel(raw: string): string {
+  // Transcripts come in with spaces and occasional filler; collapse to kebab-case and strip
+  // anything that isn't safe for a filename.
+  return raw
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, '')
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '');
+}
+
 export function parseCommand(raw: string, opts: ParseOptions): VoiceCommand | null {
   const text = normalize(raw);
   if (!text) return null;
+
+  // Capture — ordered first so "capture as pinch" can't be eaten by other matchers. Matches
+  // "capture <label>", "capture as <label>", "save <label>", "save as <label>", "record <label>".
+  const captureMatch = text.match(/^(?:capture|save|record)(?:\s+as)?\s+(.+)$/);
+  if (captureMatch) {
+    const label = sanitizeLabel(captureMatch[1].trim());
+    if (label) return { type: 'capture', label };
+  }
 
   // Close — matches "close", "close window", "close the window", etc. Rejects phrases that also
   // contain "open" so "close then open spotify" doesn't incorrectly fire close.

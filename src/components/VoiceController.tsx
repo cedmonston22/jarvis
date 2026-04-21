@@ -25,7 +25,16 @@ function buildParseOptions(): ParseOptions {
 // Top-level voice provider. Owns the single SpeechRecognition instance (via the hook), parses
 // final transcripts into commands, and dispatches them to the relevant zustand stores. Children
 // render mic buttons / status via `useVoice()` (from VoiceContext).
-export function VoiceProvider({ children }: { children: ReactNode }) {
+//
+// `onCapture` is invoked when the user says "capture <label>" / "save as <label>" etc. The parent
+// owns the landmarks ref and decides how to persist the capture (download JSON, POST to a local
+// server, etc.) — this component stays DOM- and ref-free on the capture path.
+export interface VoiceProviderProps {
+  children: ReactNode;
+  onCapture?: (label: string) => void;
+}
+
+export function VoiceProvider({ children, onCapture }: VoiceProviderProps) {
   const { supported, listening, interim, finalTranscript, error, start, stop } =
     useSpeechRecognition();
   const [lastOutcome, setLastOutcome] = useState<VoiceOutcome | null>(null);
@@ -67,8 +76,11 @@ export function VoiceProvider({ children }: { children: ReactNode }) {
         openApp('google');
         setQuery(cmd.matchedLabel ?? cmd.query);
         break;
+      case 'capture':
+        onCapture?.(cmd.label);
+        break;
     }
-  }, [finalTranscript, parseOpts, openApp, closeWindow, setQuery]);
+  }, [finalTranscript, parseOpts, openApp, closeWindow, setQuery, onCapture]);
 
   // Auto-dismiss the toast after a short window.
   useEffect(() => {
@@ -111,6 +123,8 @@ function describeOutcome(cmd: VoiceCommand | null, focusOrder: readonly string[]
       return cmd.matchedLabel
         ? `search “${cmd.matchedLabel}”`
         : `search “${cmd.query}” (no canned match)`;
+    case 'capture':
+      return `capture fixture “${cmd.label}”`;
   }
 }
 

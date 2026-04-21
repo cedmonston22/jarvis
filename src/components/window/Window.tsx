@@ -1,5 +1,7 @@
-import { useRef } from 'react';
 import { PinchTarget } from '@/components/PinchTarget';
+// Note: all window movement AND resizing are owned by WindowManager via bimanual tri-pinch
+// (split tri-pinch on matching grip zones moves; opposing zones resize; middle zooms). This
+// component renders the chrome + close button only — no single-hand drag/resize handles.
 import { AppFrame } from './AppFrame';
 import { useWindowStore, type WindowState } from '@/stores/windowStore';
 import { APPS } from '@/apps/registry';
@@ -17,18 +19,12 @@ export interface WindowProps {
   activeGrips?: ReadonlySet<Grip>;
 }
 
-// A single floating window with drag-by-titlebar, close-button, a bottom-right single-hand resize
-// handle, and 8 grip indicators (4 corners + 4 sides) used by the bimanual resize gesture.
-// Position/size live in the zustand store; this component is purely a renderer + event source.
+// A single floating window: passive title bar, close button, and 8 grip indicators (4 corners +
+// 4 sides) used by the bimanual tri-pinch gestures. All movement and resizing goes through
+// WindowManager — this component is purely a renderer.
 export function Window({ win, zIndex, activeGrips }: WindowProps) {
   const manifest = APPS[win.appId];
-  const moveWindow = useWindowStore((s) => s.moveWindow);
-  const resizeWindow = useWindowStore((s) => s.resizeWindow);
   const closeWindow = useWindowStore((s) => s.closeWindow);
-
-  // Drag/resize start positions latched on drag:start so onDragDelta can compute absolute values.
-  const dragStartRef = useRef<{ x: number; y: number } | null>(null);
-  const resizeStartRef = useRef<{ w: number; h: number } | null>(null);
 
   if (!manifest) return null;
   const Component = manifest.component;
@@ -48,28 +44,16 @@ export function Window({ win, zIndex, activeGrips }: WindowProps) {
           : undefined,
       }}
     >
-      {/* Title bar */}
+      {/* Title bar — passive header. Window movement is a bimanual tri-pinch gesture owned by
+          WindowManager; the title bar is no longer draggable on its own. */}
       <div className="flex items-stretch border-b border-white/10">
-        <PinchTarget
-          className="flex flex-1 items-center gap-2 border-none bg-transparent px-3 py-2 text-sm text-white/80"
-          onDragStart={() => {
-            dragStartRef.current = { x: win.x, y: win.y };
-          }}
-          onDragDelta={(dx, dy) => {
-            const start = dragStartRef.current;
-            if (!start) return;
-            moveWindow(win.id, start.x + dx, start.y + dy);
-          }}
-          onDragEnd={() => {
-            dragStartRef.current = null;
-          }}
-        >
+        <div className="flex flex-1 items-center gap-2 px-3 py-2 text-sm text-white/80">
           <span
             className="inline-block h-3 w-3 rounded-full"
             style={{ backgroundColor: manifest.accent ?? '#7cc8ff' }}
           />
           <span className="font-medium">{manifest.name}</span>
-        </PinchTarget>
+        </div>
         <PinchTarget
           className="flex w-10 items-center justify-center border-none bg-transparent text-lg text-white/70"
           onClick={() => closeWindow(win.id)}
@@ -81,24 +65,6 @@ export function Window({ win, zIndex, activeGrips }: WindowProps) {
       <AppFrame zoom={win.zoom}>
         <Component />
       </AppFrame>
-
-      {/* Single-hand corner resize drag handle. Independent of the bimanual grips. */}
-      <PinchTarget
-        className="absolute bottom-1 right-1 flex h-6 w-6 cursor-se-resize items-center justify-center border-none bg-transparent text-xs text-white/40"
-        onDragStart={() => {
-          resizeStartRef.current = { w: win.width, h: win.height };
-        }}
-        onDragDelta={(dx, dy) => {
-          const start = resizeStartRef.current;
-          if (!start) return;
-          resizeWindow(win.id, start.w + dx, start.h + dy);
-        }}
-        onDragEnd={() => {
-          resizeStartRef.current = null;
-        }}
-      >
-        ◢
-      </PinchTarget>
 
       {/* Grip indicators — 4 corner L-brackets + 4 side ticks. Passive affordances; hit-testing
           lives in WindowManager. Locked entries glow accent; others sit as subtle outlines. */}

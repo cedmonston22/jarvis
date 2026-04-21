@@ -115,9 +115,15 @@ export function PinchTarget({
           break;
         }
         case 'drag:start': {
-          if (pinchStartRef.current) {
+          // Only enter a drag if this target actually handles one. Without the handler check a
+          // natural pinch-wobble promotes pinch:down → drag:start, flips draggingRef, and release
+          // takes the drag-end path instead of firing onClick — user thinks the click failed.
+          // Single-hand drag on PinchTargets isn't a product feature anyway (window move/resize
+          // is tri-pinch only). AppFrame's scroll handler subscribes to the bus directly, so it
+          // keeps working independently of this gate.
+          if (pinchStartRef.current && h.onDragStart) {
             draggingRef.current = true;
-            h.onDragStart?.();
+            h.onDragStart();
           }
           break;
         }

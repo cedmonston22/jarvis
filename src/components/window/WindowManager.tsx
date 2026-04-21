@@ -3,10 +3,34 @@ import { Window, type Grip } from './Window';
 import { useWindowStore, type WindowState } from '@/stores/windowStore';
 import { useGestureBus } from '@/gestures/useGestureBus';
 
-// Resize sessions come in three flavors based on which opposing grip-pair the user grabbed:
-//   - 'resize-2d'     TL↔BR or TR↔BL: proportional 2D scale (aspect preserved)
-//   - 'resize-horizontal' L↔R: width only
-//   - 'resize-vertical'   T↔B: height only
+// Tri-pinch driven window sessions.
+//   - 1 hand tri-pinching on a grip zone (T/B/L/R or a corner) → move the window. Grabbing
+//     anywhere in the window's middle 60% with one hand does nothing — requiring a handle keeps
+//     a stray mid-window tri-pinch from starting an accidental drag.
+//   - 2 hands on matching grip zones → bimanual move (midpoint-tracked).
+//   - 2 hands on opposing corners / sides → resize (2D / horizontal / vertical).
+//   - 2 hands in the middle of the same window → zoom.
+// Sessions reconcile only on hand join/leave, so the session's cached initials stay pinned for
+// smooth deltas during continuous motion.
+type MoveSingleSession = {
+  kind: 'move-single';
+  targetId: string;
+  hand: number;
+  initialWinX: number;
+  initialWinY: number;
+  initialHandX: number;
+  initialHandY: number;
+};
+
+type MoveBimanualSession = {
+  kind: 'move-bimanual';
+  targetId: string;
+  initialWinX: number;
+  initialWinY: number;
+  initialMidX: number;
+  initialMidY: number;
+};
+
 type ResizeSession =
   | {
       kind: 'resize-2d';
@@ -42,7 +66,7 @@ type ZoomSession = {
   initialZoom: number;
 };
 
-type BimanualSession = ResizeSession | ZoomSession;
+type Session = MoveSingleSession | MoveBimanualSession | ResizeSession | ZoomSession;
 
 // Each axis is split into outer-20%/middle-60%/outer-20%. Zones OVERLAP: a pinch at top-left
 // satisfies top + left + TL all at once. The generous middle 60% is the zoom zone.
@@ -63,7 +87,7 @@ function gripZonesAtFraction(fx: number, fy: number): Set<Grip> {
   return zones;
 }
 
-function classifyPair(
+function classifyOpposingPair(
   zonesA: Set<Grip>,
   zonesB: Set<Grip>,
 ):
@@ -78,6 +102,13 @@ function classifyPair(
   if (zonesA.has('T') && zonesB.has('B')) return { kind: 'resize-vertical', gripA: 'T', gripB: 'B' };
   if (zonesA.has('B') && zonesB.has('T')) return { kind: 'resize-vertical', gripA: 'B', gripB: 'T' };
   return null;
+}
+
+// True when both zone sets share at least one grip (both TL, both L, etc.) — this is the signal
+// for "matching sides → bimanual move, not resize".
+function hasMatchingZone(a: Set<Grip>, b: Set<Grip>): boolean {
+  for (const z of a) if (b.has(z)) return true;
+  return false;
 }
 
 function pointInWindow(x: number, y: number, w: WindowState): boolean {
@@ -97,31 +128,66 @@ function findWindowAt(
   return null;
 }
 
-// Build a bimanual session from the two pinch midpoints. Returns the best-matching resize
-// session, or a zoom fallback when `allowZoomFallback=true` and the hands are over the same
-// window but not on a valid opposing grip pair.
-//
-// Called both at `bimanual:pinch:start` (fallback allowed — we always want *some* session
-// committed so the user can engage zoom with hands in the middle) and at `bimanual:pinch:move`
-// (fallback forbidden — we only upgrade to a real resize, never downgrade or spontaneously
-// commit to zoom mid-gesture).
-function classifyBimanual(
-  a: { x: number; y: number },
-  b: { x: number; y: number },
-  allowZoomFallback: boolean,
-): BimanualSession | null {
-  const { windows: wins, focusOrder: order } = useWindowStore.getState();
-  const winA = findWindowAt(a.x, a.y, wins, order);
-  const winB = findWindowAt(b.x, b.y, wins, order);
-  if (!winA || !winB || winA.id !== winB.id) return null;
-  const w = winA;
+// Per-hand tracking info. x,y are always the latest raw position; windowId/zones are populated
+// only when the hand is currently over a window (used for session derivation, not for applying
+// drag — a move-single session continues to track raw xy even if the hand leaves window bounds).
+type HandInfo = { x: number; y: number; windowId?: string; zones?: Set<Grip> };
 
-  const zonesA = gripZonesAtFraction((a.x - w.x) / w.width, (a.y - w.y) / w.height);
-  const zonesB = gripZonesAtFraction((b.x - w.x) / w.width, (b.y - w.y) / w.height);
-  const match = classifyPair(zonesA, zonesB);
+// Build a signature describing the kind + target of a session derived from the given hand map.
+// Used to detect when a session needs to transition (e.g. 1 hand → 2 hands). Position-only
+// changes inside the same kind/target don't change the signature, so initials stay pinned.
+function sessionSignature(handPos: Map<number, HandInfo>): string {
+  const overWindow = [...handPos.entries()].filter(([, i]) => i.windowId != null);
+  if (overWindow.length === 0) return 'none';
+  if (overWindow.length === 1) {
+    const [hand, info] = overWindow[0];
+    // Single-hand move requires a handle — the outer 20% bands only. Pinching in the middle
+    // 60% with one hand produces an empty zone set and does nothing.
+    if (!info.zones || info.zones.size === 0) return 'none';
+    return `move-single:${info.windowId}:h${hand}`;
+  }
+  const sorted = overWindow.sort(([a], [b]) => a - b).slice(0, 2);
+  const [[, a], [, b]] = sorted;
+  if (a.windowId !== b.windowId) return 'cross-window';
+  const pair = classifyOpposingPair(a.zones!, b.zones!);
+  if (pair) return `${pair.kind}:${a.windowId}:${pair.gripA}-${pair.gripB}`;
+  if (hasMatchingZone(a.zones!, b.zones!)) return `move-bimanual:${a.windowId}`;
+  return `zoom:${a.windowId}`;
+}
 
-  if (match) {
-    const { kind, gripA, gripB } = match;
+// Derive a fresh session from the current tri-pinch state, anchoring all initial values to the
+// live window + hand positions. Called at signature-change transitions; moves just re-apply the
+// session's cached initials against the latest positions.
+function deriveSession(handPos: Map<number, HandInfo>): Session | null {
+  const overWindow = [...handPos.entries()].filter(([, i]) => i.windowId != null);
+  if (overWindow.length === 0) return null;
+  const { windows } = useWindowStore.getState();
+
+  if (overWindow.length === 1) {
+    const [hand, info] = overWindow[0];
+    if (!info.zones || info.zones.size === 0) return null;
+    const w = windows[info.windowId!];
+    if (!w) return null;
+    return {
+      kind: 'move-single',
+      targetId: w.id,
+      hand,
+      initialWinX: w.x,
+      initialWinY: w.y,
+      initialHandX: info.x,
+      initialHandY: info.y,
+    };
+  }
+
+  const sorted = overWindow.sort(([a], [b]) => a - b).slice(0, 2);
+  const [[, a], [, b]] = sorted;
+  if (a.windowId !== b.windowId) return null;
+  const w = windows[a.windowId!];
+  if (!w) return null;
+
+  const pair = classifyOpposingPair(a.zones!, b.zones!);
+  if (pair) {
+    const { kind, gripA, gripB } = pair;
     if (kind === 'resize-2d') {
       return {
         kind: 'resize-2d',
@@ -154,10 +220,88 @@ function classifyBimanual(
     };
   }
 
-  if (!allowZoomFallback) return null;
+  if (hasMatchingZone(a.zones!, b.zones!)) {
+    return {
+      kind: 'move-bimanual',
+      targetId: w.id,
+      initialWinX: w.x,
+      initialWinY: w.y,
+      initialMidX: (a.x + b.x) / 2,
+      initialMidY: (a.y + b.y) / 2,
+    };
+  }
+
   const initialHorzDist = Math.abs(a.x - b.x);
   if (initialHorzDist < 1) return null;
   return { kind: 'zoom', targetId: w.id, initialHorzDist, initialZoom: w.zoom };
+}
+
+// Apply the active session using the current hand positions. Each kind reads the hand positions
+// it needs and dispatches to the store. Silently no-ops if required hands aren't present.
+function applySession(session: Session, handPos: Map<number, HandInfo>): void {
+  const { windows } = useWindowStore.getState();
+  const w = windows[session.targetId];
+  if (!w) return;
+  const store = useWindowStore.getState();
+
+  if (session.kind === 'move-single') {
+    const info = handPos.get(session.hand);
+    if (!info) return;
+    store.moveWindow(
+      session.targetId,
+      session.initialWinX + (info.x - session.initialHandX),
+      session.initialWinY + (info.y - session.initialHandY),
+    );
+    return;
+  }
+
+  if (session.kind === 'move-bimanual') {
+    const pair = [...handPos.values()].slice(0, 2);
+    if (pair.length < 2) return;
+    const [a, b] = pair;
+    const midX = (a.x + b.x) / 2;
+    const midY = (a.y + b.y) / 2;
+    store.moveWindow(
+      session.targetId,
+      session.initialWinX + (midX - session.initialMidX),
+      session.initialWinY + (midY - session.initialMidY),
+    );
+    return;
+  }
+
+  const sorted = [...handPos.entries()].sort(([a], [b]) => a - b).slice(0, 2);
+  if (sorted.length < 2) return;
+  const [[, a], [, b]] = sorted;
+
+  if (session.kind === 'zoom') {
+    const currentHorzDist = Math.abs(a.x - b.x);
+    const targetZoom = session.initialZoom * (currentHorzDist / session.initialHorzDist);
+    store.zoomWindow(session.targetId, targetZoom - w.zoom);
+    return;
+  }
+
+  if (session.kind === 'resize-2d') {
+    const currentDist = Math.hypot(a.x - b.x, a.y - b.y);
+    const scale = currentDist / session.initialDist;
+    const newWidth = session.initialWidth * scale;
+    const newHeight = session.initialHeight * scale;
+    store.moveWindow(session.targetId, session.centerX - newWidth / 2, session.centerY - newHeight / 2);
+    store.resizeWindow(session.targetId, newWidth, newHeight);
+    return;
+  }
+
+  if (session.kind === 'resize-horizontal') {
+    const currentHorzDist = Math.abs(a.x - b.x);
+    const newWidth = session.initialWidth * (currentHorzDist / session.initialHorzDist);
+    store.moveWindow(session.targetId, session.centerX - newWidth / 2, w.y);
+    store.resizeWindow(session.targetId, newWidth, w.height);
+    return;
+  }
+
+  const currentVertDist = Math.abs(a.y - b.y);
+  const newHeight = session.initialHeight * (currentVertDist / session.initialVertDist);
+  store.moveWindow(session.targetId, w.x, session.centerY - newHeight / 2);
+  store.resizeWindow(session.targetId, w.width, newHeight);
 }
 
 // Shallow equality for Map<string, Set<Grip>>. Used to skip React re-renders when the per-window
@@ -178,15 +322,13 @@ export function WindowManager() {
   const focusWindow = useWindowStore((s) => s.focusWindow);
   const bus = useGestureBus();
 
-  const bimanualSessionRef = useRef<BimanualSession | null>(null);
+  const sessionRef = useRef<Session | null>(null);
+  const sessionSigRef = useRef<string>('none');
 
-  // Per-hand current position: which window each pinching hand is over + which grip zones it
-  // occupies. Updated from hand:pinch:start / :move / :end events. Ref because it changes every
-  // frame; we only promote to React state when the DERIVED per-window grip sets actually change.
-  const handPosRef = useRef<Map<number, { windowId: string; zones: Set<Grip> }>>(new Map());
+  // Per-hand live tri-pinch position. Always records x,y; populates windowId/zones only when
+  // the hand is currently over a window. Used for session derivation + live grip glow.
+  const handPosRef = useRef<Map<number, HandInfo>>(new Map());
 
-  // Per-window active grip set = union of all currently-pinching hands' grip zones on that window.
-  // Drives the glowing anchors on each Window. Using a Map so we can pass per-window sets cheaply.
   const [activeGripsByWindow, setActiveGripsByWindow] = useState<
     Map<string, ReadonlySet<Grip>>
   >(new Map());
@@ -195,6 +337,7 @@ export function WindowManager() {
     const recomputeActiveGrips = () => {
       const next = new Map<string, Set<Grip>>();
       for (const info of handPosRef.current.values()) {
+        if (!info.windowId || !info.zones) continue;
         const existing = next.get(info.windowId) ?? new Set<Grip>();
         for (const g of info.zones) existing.add(g);
         next.set(info.windowId, existing);
@@ -205,12 +348,22 @@ export function WindowManager() {
     const updateHandPosition = (hand: number, x: number, y: number) => {
       const { windows: wins, focusOrder: order } = useWindowStore.getState();
       const win = findWindowAt(x, y, wins, order);
-      if (!win) {
-        handPosRef.current.delete(hand);
-      } else {
-        const zones = gripZonesAtFraction((x - win.x) / win.width, (y - win.y) / win.height);
-        handPosRef.current.set(hand, { windowId: win.id, zones });
+      const info: HandInfo = { x, y };
+      if (win) {
+        info.windowId = win.id;
+        info.zones = gripZonesAtFraction((x - win.x) / win.width, (y - win.y) / win.height);
       }
+      handPosRef.current.set(hand, info);
+    };
+
+    // Re-check session identity against the current hand state. On a signature change, spin up
+    // a fresh session anchored to the live positions (so the drag doesn't jump). On no change,
+    // leave the existing session + its cached initials untouched.
+    const reconcileSession = () => {
+      const sig = sessionSignature(handPosRef.current);
+      if (sig === sessionSigRef.current) return;
+      sessionSigRef.current = sig;
+      sessionRef.current = deriveSession(handPosRef.current);
     };
 
     const unsub = bus.subscribe((e) => {
@@ -221,80 +374,32 @@ export function WindowManager() {
         return;
       }
 
-      if (e.type === 'hand:pinch:start' || e.type === 'hand:pinch:move') {
+      if (e.type === 'hand:triPinch:start') {
+        updateHandPosition(e.hand, e.x, e.y);
+        // Focus the window under the first tri-pinching hand — so the bimanual resize / move
+        // target is always brought to front the moment the user commits.
+        const info = handPosRef.current.get(e.hand);
+        if (info?.windowId) focusWindow(info.windowId);
+        reconcileSession();
+        recomputeActiveGrips();
+        if (sessionRef.current) applySession(sessionRef.current, handPosRef.current);
+        return;
+      }
+
+      if (e.type === 'hand:triPinch:move') {
         updateHandPosition(e.hand, e.x, e.y);
         recomputeActiveGrips();
+        // Moves never change session identity (kind/target stays latched until a hand
+        // joins/leaves). Just replay the session against the latest positions.
+        if (sessionRef.current) applySession(sessionRef.current, handPosRef.current);
         return;
       }
-      if (e.type === 'hand:pinch:end') {
+
+      if (e.type === 'hand:triPinch:end') {
         handPosRef.current.delete(e.hand);
+        reconcileSession();
         recomputeActiveGrips();
-        return;
-      }
-
-      if (e.type === 'bimanual:pinch:start') {
-        bimanualSessionRef.current = classifyBimanual(e.a, e.b, true);
-        return;
-      }
-
-      if (e.type === 'bimanual:pinch:move') {
-        // Mid-gesture upgrade: if the user pinched-down before landing both hands on a grip pair
-        // (so we committed to zoom, or nothing), re-check each frame. The moment both hands are
-        // over a valid opposing grip pair, swap to a resize session anchored to the current
-        // positions. We never downgrade a resize back to zoom — once upgraded, it locks.
-        let session = bimanualSessionRef.current;
-        if (!session || session.kind === 'zoom') {
-          const upgrade = classifyBimanual(e.a, e.b, false);
-          if (upgrade && upgrade.kind !== 'zoom') {
-            session = upgrade;
-            bimanualSessionRef.current = upgrade;
-          }
-        }
-        if (!session) return;
-        const { windows: wins } = useWindowStore.getState();
-        const win = wins[session.targetId];
-        if (!win) return;
-
-        if (session.kind === 'zoom') {
-          const currentHorzDist = Math.abs(e.a.x - e.b.x);
-          const targetZoom = session.initialZoom * (currentHorzDist / session.initialHorzDist);
-          useWindowStore.getState().zoomWindow(session.targetId, targetZoom - win.zoom);
-          return;
-        }
-
-        if (session.kind === 'resize-2d') {
-          const currentDist = Math.hypot(e.a.x - e.b.x, e.a.y - e.b.y);
-          const scale = currentDist / session.initialDist;
-          const newWidth = session.initialWidth * scale;
-          const newHeight = session.initialHeight * scale;
-          useWindowStore
-            .getState()
-            .moveWindow(session.targetId, session.centerX - newWidth / 2, session.centerY - newHeight / 2);
-          useWindowStore.getState().resizeWindow(session.targetId, newWidth, newHeight);
-          return;
-        }
-
-        if (session.kind === 'resize-horizontal') {
-          const currentHorzDist = Math.abs(e.a.x - e.b.x);
-          const newWidth = session.initialWidth * (currentHorzDist / session.initialHorzDist);
-          useWindowStore
-            .getState()
-            .moveWindow(session.targetId, session.centerX - newWidth / 2, win.y);
-          useWindowStore.getState().resizeWindow(session.targetId, newWidth, win.height);
-          return;
-        }
-
-        const currentVertDist = Math.abs(e.a.y - e.b.y);
-        const newHeight = session.initialHeight * (currentVertDist / session.initialVertDist);
-        useWindowStore
-          .getState()
-          .moveWindow(session.targetId, win.x, session.centerY - newHeight / 2);
-        useWindowStore.getState().resizeWindow(session.targetId, win.width, newHeight);
-        return;
-      }
-
-      if (e.type === 'bimanual:pinch:end') {
-        bimanualSessionRef.current = null;
+        if (sessionRef.current) applySession(sessionRef.current, handPosRef.current);
       }
     });
     return unsub;

@@ -142,6 +142,33 @@ export function pinchDistance(hand: Hand): number {
   return Math.min(ratio3D, ratio2D);
 }
 
+// Three-finger pinch measure: how far apart thumb/index/middle tips are, as a fraction of index
+// finger length. Returns the MAX of the three pairwise normalized distances so the value only
+// reads "small" when ALL three tips are touching. Used to gate bimanual resize/zoom so a
+// deliberate three-finger pose is required (differentiates from the thumb+index click pinch).
+// Same 2D/3D min trick as pinchDistance — front-facing hands get noisy z.
+export function triPinchDistance(hand: Hand): number {
+  const tipT = hand[FINGERTIPS.thumb];
+  const tipI = hand[FINGERTIPS.index];
+  const tipM = hand[FINGERTIPS.middle];
+  const mcpI = hand[5];
+
+  const dxIM = tipI.x - mcpI.x;
+  const dyIM = tipI.y - mcpI.y;
+  const dzIM = tipI.z - mcpI.z;
+  const fingerLen3D = Math.hypot(dxIM, dyIM, dzIM);
+  const fingerLen2D = Math.hypot(dxIM, dyIM);
+
+  const pair = (a: Landmark, b: Landmark): number => {
+    const dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
+    const ratio3D = fingerLen3D > 0 ? Math.hypot(dx, dy, dz) / fingerLen3D : Infinity;
+    const ratio2D = fingerLen2D > 0.02 ? Math.hypot(dx, dy) / fingerLen2D : Infinity;
+    return Math.min(ratio3D, ratio2D);
+  };
+
+  return Math.max(pair(tipT, tipI), pair(tipT, tipM), pair(tipI, tipM));
+}
+
 // Thumb-tip ↔ pinky-tip distance normalized by the middle-finger length (wrist→middle-tip).
 // Measures how WIDE the fingers are fanned out, irrespective of hand distance from the camera.
 // Fingers bunched together reads small; fingers fanned wide apart reads large. Used by the zoom

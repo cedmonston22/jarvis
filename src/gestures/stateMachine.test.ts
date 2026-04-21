@@ -149,11 +149,13 @@ describe('reduce — pinch lifecycle', () => {
     expect(state.frozenCursor).not.toBeNull();
   });
 
-  it('emits pointer:move from IDLE so hover works without a pointing pose', () => {
-    // A single frame of any visible hand should light the cursor — previously only POINTING did.
+  it('does not emit pointer:move from IDLE when pose is not pointing', () => {
+    // Cursor is gated on the actual pointing pose — a waving/fisted hand should NOT cursor.
+    // Waving registered as pointing previously because IDLE emitted unconditionally; now the pose
+    // check (index extended, middle/ring/pinky curled) guards the emission.
     const { allEvents } = run([fistHand()]);
     const flat = allEvents.flatMap((e) => e.events);
-    expect(flat.some((e) => e.type === 'pointer:move')).toBe(true);
+    expect(flat.some((e) => e.type === 'pointer:move')).toBe(false);
   });
 
   it('emits a release event when pinch releases after commit', () => {
