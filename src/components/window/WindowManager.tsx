@@ -115,16 +115,21 @@ function pointInWindow(x: number, y: number, w: WindowState): boolean {
   return x >= w.x && x <= w.x + w.width && y >= w.y && y <= w.y + w.height;
 }
 
+// Only the frontmost window can be targeted. This is the single-source restriction enforcing
+// "only the front window is interactive" — a hand over a back window returns null, so no
+// tri-pinch session starts and no pinch:down focus change fires on non-front windows. The
+// user changes focus by opening via the dock or by voice ("open spotify"), not by poking
+// through a window.
 function findWindowAt(
   x: number,
   y: number,
   wins: Record<string, WindowState>,
   order: readonly string[],
 ): WindowState | null {
-  for (let i = order.length - 1; i >= 0; i--) {
-    const w = wins[order[i]];
-    if (w && pointInWindow(x, y, w)) return w;
-  }
+  const frontId = order[order.length - 1];
+  if (!frontId) return null;
+  const w = wins[frontId];
+  if (w && pointInWindow(x, y, w)) return w;
   return null;
 }
 
@@ -412,12 +417,15 @@ export function WindowManager() {
         if (!win) return null;
         // z-index base of 20 keeps windows above the background canvas (z=0) but below the
         // subject canvas (z=30) so a re-enabled segmenter puts the user's hand in front.
+        // isFront: only the last window in focusOrder accepts gestures. Non-front windows get
+        // a stub bus inside them, so their PinchTargets / scroll handlers never fire.
         return (
           <Window
             key={id}
             win={win}
             zIndex={20 + i}
             activeGrips={activeGripsByWindow.get(id)}
+            isFront={i === focusOrder.length - 1}
           />
         );
       })}

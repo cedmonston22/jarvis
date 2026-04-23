@@ -8,6 +8,8 @@ import { Dock } from './Dock';
 import { useGestures } from '@/hooks/useGestures';
 import { GestureBusProvider } from '@/gestures/BusContext';
 import { VoiceProvider } from './VoiceController';
+import { OnboardingProvider } from './OnboardingOverlay';
+import { useOnboarding } from './OnboardingContext';
 import type { Hands } from '@/gestures/types';
 
 // Top-level container. Owns the per-frame refs that multiple children read from:
@@ -19,13 +21,14 @@ import type { Hands } from '@/gestures/types';
 //
 // Keyboard shortcuts:
 //   - D: toggle the debug landmark overlay.
+//   - H: toggle the onboarding / gesture-reference overlay.
 //   - Shift+F: dump current landmarks to clipboard as JSON for fixture capture (see CLAUDE.md).
 export function Stage() {
   const fpsRef = useRef(0);
   const landmarksRef = useRef<Hands>([]);
   const lumaRef = useRef(0.5);
   const darkModeRef = useRef(false);
-  const { bus, modeRef, tapStateRef, pinchDistRef } = useGestures(landmarksRef);
+  const { bus, modeRef, tapStateRef, pinchDistRef, passivePoseRef } = useGestures(landmarksRef);
 
   const [showDebug, setShowDebug] = useState(true);
   const [hint, setHint] = useState<string | null>(null);
@@ -89,41 +92,69 @@ export function Stage() {
   return (
     <GestureBusProvider bus={bus}>
       <VoiceProvider onCapture={handleCapture}>
-        <div className="relative h-full w-full overflow-hidden">
-          <CameraCanvas
-            fpsRef={fpsRef}
-            landmarksRef={landmarksRef}
-            lumaRef={lumaRef}
-            darkModeRef={darkModeRef}
-          />
-          <WindowManager />
-          <Dock />
-          <HandOverlay landmarksRef={landmarksRef} modeRef={modeRef} visible={showDebug} />
-          <FpsHud fpsRef={fpsRef} />
-          <GestureHud
-            modeRef={modeRef}
-            tapStateRef={tapStateRef}
-            pinchDistRef={pinchDistRef}
-            lumaRef={lumaRef}
-            darkModeRef={darkModeRef}
-            bus={bus}
-          />
-          <DebugLegend showDebug={showDebug} />
-          {hint && (
-            <div className="pointer-events-none fixed left-1/2 top-3 z-50 -translate-x-1/2 rounded-md border border-jarvis-stroke bg-black/70 px-3 py-1 font-mono text-xs text-jarvis-accent">
-              {hint}
-            </div>
-          )}
-        </div>
+        <OnboardingProvider>
+          <OnboardingHotkey />
+          <div className="relative h-full w-full overflow-hidden">
+            <CameraCanvas
+              fpsRef={fpsRef}
+              landmarksRef={landmarksRef}
+              lumaRef={lumaRef}
+              darkModeRef={darkModeRef}
+            />
+            <WindowManager />
+            <Dock />
+            <HandOverlay landmarksRef={landmarksRef} modeRef={modeRef} visible={showDebug} />
+            <FpsHud fpsRef={fpsRef} />
+            <GestureHud
+              modeRef={modeRef}
+              tapStateRef={tapStateRef}
+              pinchDistRef={pinchDistRef}
+              passivePoseRef={passivePoseRef}
+              lumaRef={lumaRef}
+              darkModeRef={darkModeRef}
+              bus={bus}
+            />
+            <DebugLegend showDebug={showDebug} />
+            {hint && (
+              <div className="pointer-events-none fixed left-1/2 top-3 z-50 -translate-x-1/2 rounded-md border border-jarvis-stroke bg-black/70 px-3 py-1 font-mono text-xs text-jarvis-accent">
+                {hint}
+              </div>
+            )}
+          </div>
+        </OnboardingProvider>
       </VoiceProvider>
     </GestureBusProvider>
   );
+}
+
+// Listens for the H key and toggles the onboarding overlay. Split out so it can live inside
+// <OnboardingProvider> and use the context; the main Stage keydown handler handles D / Shift+F.
+function OnboardingHotkey() {
+  const { toggle } = useOnboarding();
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (
+        e.target instanceof HTMLElement &&
+        (e.target.isContentEditable || ['INPUT', 'TEXTAREA'].includes(e.target.tagName))
+      ) {
+        return;
+      }
+      if ((e.key === 'h' || e.key === 'H') && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) {
+        toggle();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [toggle]);
+  return null;
 }
 
 function DebugLegend({ showDebug }: { showDebug: boolean }) {
   return (
     <div className="pointer-events-none fixed left-3 top-3 z-50 rounded-md border border-white/20 bg-black/60 px-2.5 py-1 font-mono text-xs text-white/70 backdrop-blur">
       <span className="text-white/50">D</span> debug {showDebug ? 'on' : 'off'}
+      <span className="mx-2 text-white/25">·</span>
+      <span className="text-white/50">H</span> help
       <span className="mx-2 text-white/25">·</span>
       <span className="text-white/50">Shift+F</span> copy landmarks
     </div>

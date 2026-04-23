@@ -9,6 +9,7 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { isPointerPose } from '@/gestures/detectors/pointer';
+import { isFist, isOpenHand } from '@/gestures/detectors/poses';
 import { pinchDistance, triPinchDistance } from '@/gestures/fingers';
 import { DEFAULT_TUNING } from '@/gestures/stateMachine';
 import { DEFAULT_HAND_PINCH_TUNING } from '@/gestures/detectors/handPinch';
@@ -92,6 +93,35 @@ const TRI_PINCH_NEGATIVES = [
 
 const BIMANUAL_POSITIVES = ['bimanual-opposing', 'bimanual-matching'];
 
+// Passive-pose classification. Only `fist` should classify as a fist; only `wave-open-palm`
+// should classify as open. Everything else — including every pointing pose, pinch pose, and
+// tri-pinch pose — must fall through to "none" or the whole pose gate becomes a liability,
+// suppressing valid interactions.
+const FIST_ONLY = ['fist', 'fist-side'];
+const OPEN_ONLY = ['wave-open-palm'];
+const NOT_PASSIVE = [
+  'clean-point',
+  'clean-point-left',
+  'point-loose-middle',
+  'point-edge-left',
+  'point-edge-right',
+  'point-far',
+  'backlit-point-loose-middle',
+  'peace-sign',
+  'pinch-front-facing',
+  'pinch-side-facing',
+  'pinch-tilted',
+  'ok-light-pinch-front-facing',
+  'ok-light-pinch-side-facing',
+  'backlit-pinch-side-facing',
+  'tri-pinch-tight',
+  'tri-pinch-front-facing',
+  'tri-pinch-side-facing',
+  'backlit-tri-pinch-tight',
+  'backlit-tri-pinch-front-facing',
+  'claw-false-pinch',
+];
+
 describe('real-world fixtures', () => {
   describe('isPointerPose', () => {
     for (const name of POINTING_POSITIVES) {
@@ -130,6 +160,26 @@ describe('real-world fixtures', () => {
     for (const name of TRI_PINCH_NEGATIVES) {
       it(`${name} ≥ triPinchIn (${threshold})`, () => {
         expect(triPinchDistance(primary(name))).toBeGreaterThanOrEqual(threshold);
+      });
+    }
+  });
+
+  describe('passive poses', () => {
+    for (const name of FIST_ONLY) {
+      it(`${name} → isFist`, () => {
+        expect(isFist(primary(name))).toBe(true);
+      });
+    }
+    for (const name of OPEN_ONLY) {
+      it(`${name} → isOpenHand`, () => {
+        expect(isOpenHand(primary(name))).toBe(true);
+      });
+    }
+    for (const name of NOT_PASSIVE) {
+      it(`${name} → not passive`, () => {
+        const h = primary(name);
+        expect(isFist(h)).toBe(false);
+        expect(isOpenHand(h)).toBe(false);
       });
     }
   });

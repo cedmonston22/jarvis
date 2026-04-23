@@ -2,11 +2,13 @@ import { useEffect, useState } from 'react';
 import type { Mode } from '@/gestures/stateMachine';
 import type { TapState } from '@/gestures/detectors/airTap';
 import type { GestureBus, GestureEvent } from '@/gestures/bus';
+import type { PassivePose } from '@/hooks/useGestures';
 
 export interface GestureHudProps {
   modeRef: React.MutableRefObject<Mode>;
   tapStateRef: React.MutableRefObject<TapState>;
   pinchDistRef: React.MutableRefObject<number>;
+  passivePoseRef: React.MutableRefObject<PassivePose>;
   lumaRef?: React.MutableRefObject<number>;
   darkModeRef?: React.MutableRefObject<boolean>;
   bus: GestureBus;
@@ -15,11 +17,12 @@ export interface GestureHudProps {
 // Tiny debug HUD: current mode + last few events + live air-tap signal. Polls refs at 10Hz
 // (cheap) and subscribes to the bus for events. The tap signal helps calibrate the thresholds —
 // if you see vz never going negative during a forward poke, the detector will never fire.
-export function GestureHud({ modeRef, tapStateRef, pinchDistRef, lumaRef, darkModeRef, bus }: GestureHudProps) {
+export function GestureHud({ modeRef, tapStateRef, pinchDistRef, passivePoseRef, lumaRef, darkModeRef, bus }: GestureHudProps) {
   const [mode, setMode] = useState<Mode>('IDLE');
   const [tapPhase, setTapPhase] = useState('IDLE');
   const [minStraight, setMinStraight] = useState(1);
   const [pinchDist, setPinchDist] = useState(0);
+  const [passive, setPassive] = useState<PassivePose>('none');
   const [luma, setLuma] = useState(0.5);
   const [darkMode, setDarkMode] = useState(false);
   const [log, setLog] = useState<string[]>([]);
@@ -30,11 +33,12 @@ export function GestureHud({ modeRef, tapStateRef, pinchDistRef, lumaRef, darkMo
       setTapPhase(tapStateRef.current.phase);
       setMinStraight(tapStateRef.current.minStraight);
       setPinchDist(pinchDistRef.current);
+      setPassive(passivePoseRef.current);
       if (lumaRef) setLuma(lumaRef.current);
       if (darkModeRef) setDarkMode(darkModeRef.current);
     }, 100);
     return () => window.clearInterval(id);
-  }, [modeRef, tapStateRef, pinchDistRef, lumaRef, darkModeRef]);
+  }, [modeRef, tapStateRef, pinchDistRef, passivePoseRef, lumaRef, darkModeRef]);
 
   useEffect(() => {
     // Filter continuous streams (pointer:move, drag:move, bimanual:pinch:move) so we don't
@@ -56,6 +60,11 @@ export function GestureHud({ modeRef, tapStateRef, pinchDistRef, lumaRef, darkMo
       <div className="flex items-center gap-2">
         <span className="inline-block h-2 w-2 rounded-full" style={{ background: modeColor(mode) }} />
         <span className="text-white/95">{mode}</span>
+        {passive !== 'none' && (
+          <span className="rounded bg-amber-300/20 px-1 text-[10px] text-amber-300">
+            {passive === 'fist' ? 'FIST' : 'OPEN'} — suppressed
+          </span>
+        )}
       </div>
       <div className="mt-1 flex items-center gap-2 text-[10px] text-white/55">
         <span>curl {tapPhase.toLowerCase()}</span>

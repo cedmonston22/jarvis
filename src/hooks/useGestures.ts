@@ -9,7 +9,7 @@ import {
 } from '@/gestures/stateMachine';
 import { createGestureBus, type GestureBus } from '@/gestures/bus';
 import { FINGERTIPS } from '@/gestures/handTopology';
-import { fingerStraightness2D, handBBox, pinchDistance } from '@/gestures/fingers';
+import { fingerStraightness2D, pinchDistance } from '@/gestures/fingers';
 import {
   createTapState,
   stepTapDetector,
@@ -18,25 +18,20 @@ import {
   type TapTuning,
 } from '@/gestures/detectors/airTap';
 import {
-  createForwardTapState,
-  stepForwardTapDetector,
-  DEFAULT_FORWARD_TAP_TUNING,
-  type ForwardTapState,
-  type ForwardTapTuning,
-} from '@/gestures/detectors/forwardTap';
-import {
   createHandPinchState,
   stepHandPinch,
   DEFAULT_HAND_PINCH_TUNING,
   type HandPinchState,
   type HandPinchTuning,
 } from '@/gestures/detectors/handPinch';
+import { isFist, isOpenHand } from '@/gestures/detectors/poses';
 import type { Hands } from '@/gestures/types';
+
+export type PassivePose = 'none' | 'fist' | 'open';
 
 export interface UseGesturesOptions {
   tuning?: Tuning;
   tap?: TapTuning;
-  forwardTap?: ForwardTapTuning;
   handPinch?: HandPinchTuning;
 }
 
@@ -48,6 +43,10 @@ export interface UseGesturesResult {
   tapStateRef: React.MutableRefObject<TapState>;
   // Live pinch-distance reading on the primary hand, for HUD calibration.
   pinchDistRef: React.MutableRefObject<number>;
+  // Primary-hand passive-pose classification for the HUD. 'none' when the hand is doing anything
+  // meaningful (pointing, pinching, tri-pinching, transitioning); 'fist' / 'open' when we've
+  // explicitly short-circuited event emission because the pose is a geometric dead-end.
+  passivePoseRef: React.MutableRefObject<PassivePose>;
 }
 
 // Drives the gesture state machine from the landmarks ref, running at RAF cadence. Emits discrete
@@ -70,16 +69,15 @@ export function useGestures(
   const modeRef = useRef<Mode>('IDLE');
   const tapStatesRef = useRef<TapState[]>([]);
   const primaryTapRef = useRef<TapState>(createTapState());
-  const forwardTapStatesRef = useRef<ForwardTapState[]>([]);
   const handPinchStatesRef = useRef<HandPinchState[]>([]);
   // Tracks whether the bimanual gesture is currently active so we can emit the right transition
   // event (start / end). Persists across frames.
   const bimanualActiveRef = useRef<boolean>(false);
   const pinchDistRef = useRef<number>(0);
+  const passivePoseRef = useRef<PassivePose>('none');
 
   const tuning = opts.tuning ?? DEFAULT_TUNING;
   const tapTuning = opts.tap ?? DEFAULT_TAP_TUNING;
-  const forwardTapTuning = opts.forwardTap ?? DEFAULT_FORWARD_TAP_TUNING;
   const handPinchTuning = opts.handPinch ?? DEFAULT_HAND_PINCH_TUNING;
 
   useEffect(() => {
@@ -97,13 +95,6 @@ export function useGestures(
         }
       } else if (tapStatesRef.current.length > hands.length) {
         tapStatesRef.current.length = hands.length;
-      }
-      if (forwardTapStatesRef.current.length < hands.length) {
-        while (forwardTapStatesRef.current.length < hands.length) {
-          forwardTapStatesRef.current.push(createForwardTapState());
-        }
-      } else if (forwardTapStatesRef.current.length > hands.length) {
-        forwardTapStatesRef.current.length = hands.length;
       }
       // Emit hand:pinch:end / hand:triPinch:end for any hand that disappeared while still
       // pinching, before we truncate the per-hand state array.
@@ -123,6 +114,17 @@ export function useGestures(
         handPinchStatesRef.current.length = hands.length;
       }
 
+      // --- Per-hand passive pose classification. Fist or open-palm-wave short-circuits everything:
+      // no clicks, no pinch entry, no tri-pinch sessions. The individual detectors already reject
+      // these shapes in the common case, but transitional frames (opening from fist to point) can
+      // leak false positives — this explicit gate stops them. Computed once per hand, reused below.
+      const passivePerHand: PassivePose[] = hands.map((h) => {
+        if (isFist(h)) return 'fist';
+        if (isOpenHand(h)) return 'open';
+        return 'none';
+      });
+      passivePoseRef.current = passivePerHand[0] ?? 'none';
+
       // --- Step 1: step all tap detectors using the PREVIOUS frame's mode for clickOk. ---
       // While pinching/dragging, clickOk is false, which forces the tap detector into cooldown —
       // any finger-curl transient during a pinch won't fire a click the moment the pinch ends.
@@ -132,27 +134,18 @@ export function useGestures(
       for (let i = 0; i < hands.length; i++) {
         const hand = hands[i];
         const straightness = fingerStraightness2D(hand, 1);
-        const bbox = handBBox(hand);
-        const diagonal = Math.hypot(bbox.width, bbox.height);
+        const passive = passivePerHand[i] !== 'none';
 
-        if (!clickOk) {
-          // Force both click detectors into cooldown while pinching/dragging. Any click transient
-          // during a pinch shouldn't fire the moment the pinch ends.
+        if (!clickOk || passive) {
+          // Force the click detector into cooldown while pinching/dragging, OR while the hand is
+          // in a passive pose (fist/wave). Any finger-curl transient shouldn't fire a click the
+          // moment the pose resolves.
           tapStatesRef.current[i] = {
             phase: 'COOLDOWN',
             cooldown: tapTuning.cooldownFrames,
             minStraight: 1,
             curlFrames: 0,
           };
-          // Keep forward-tap state consistent — still step it so prevDiagonal updates, but with
-          // allowFire=false so it can't produce a click.
-          const { state: ftNext } = stepForwardTapDetector(
-            forwardTapStatesRef.current[i],
-            diagonal,
-            false,
-            forwardTapTuning,
-          );
-          forwardTapStatesRef.current[i] = ftNext;
           continue;
         }
         const { state: tapNext, fired: curlFired } = stepTapDetector(
@@ -163,22 +156,18 @@ export function useGestures(
         );
         tapStatesRef.current[i] = tapNext;
 
-        const { state: ftNext, fired: forwardFired } = stepForwardTapDetector(
-          forwardTapStatesRef.current[i],
-          diagonal,
-          clickOk,
-          forwardTapTuning,
-        );
-        forwardTapStatesRef.current[i] = ftNext;
-
-        if (curlFired || forwardFired) tapFired.push({ handIdx: i });
+        if (curlFired) tapFired.push({ handIdx: i });
       }
       primaryTapRef.current =
         hands.length > 0 ? tapStatesRef.current[0] : createTapState();
 
       // --- Step 2: state machine. suppressPinch prevents click-curls from being misread as
-      // pinches — if the primary tap detector is mid-curl, pinch entry is vetoed. ---
-      const suppressPinch = primaryTapRef.current.phase === 'CURLING';
+      // pinches — if the primary tap detector is mid-curl, pinch entry is vetoed. Also gated on
+      // passive pose so a fist doesn't slide into PINCH_PENDING the moment thumb+index end up
+      // close enough inside the fold. Doesn't affect in-progress drags — suppressPinch only
+      // blocks IDLE → PINCH_PENDING. ---
+      const suppressPinch =
+        primaryTapRef.current.phase === 'CURLING' || passivePoseRef.current !== 'none';
       const { state: next, events } = reduce(
         stateRef.current,
         { hand: primary, t: now, viewport, suppressPinch },
@@ -209,7 +198,14 @@ export function useGestures(
       const triPinchingPoints: { x: number; y: number }[] = [];
       for (let i = 0; i < hands.length; i++) {
         const prevState = handPinchStatesRef.current[i];
-        const nextState = stepHandPinch(prevState, hands[i], viewport, handPinchTuning);
+        let nextState = stepHandPinch(prevState, hands[i], viewport, handPinchTuning);
+        // Passive-pose short-circuit. If the hand is in fist/wave, the detector's raw readings
+        // might still say "pinching" (a tightly-closed fist can put thumb+index within the
+        // pinchIn threshold). Force isPinching / isTriPinching off — the transition emission
+        // below fires the end events cleanly if they were active last frame.
+        if (passivePerHand[i] !== 'none') {
+          nextState = { ...nextState, isPinching: false, isTriPinching: false };
+        }
         handPinchStatesRef.current[i] = nextState;
         if (!prevState.isPinching && nextState.isPinching) {
           bus.emit({ type: 'hand:pinch:start', hand: i, x: nextState.midpoint.x, y: nextState.midpoint.y });
@@ -246,7 +242,7 @@ export function useGestures(
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [landmarksRef, bus, tuning, tapTuning, forwardTapTuning, handPinchTuning]);
+  }, [landmarksRef, bus, tuning, tapTuning, handPinchTuning]);
 
-  return { bus, stateRef, modeRef, tapStateRef: primaryTapRef, pinchDistRef };
+  return { bus, stateRef, modeRef, tapStateRef: primaryTapRef, pinchDistRef, passivePoseRef };
 }

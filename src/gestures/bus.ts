@@ -55,3 +55,16 @@ export function createGestureBus(): GestureBus {
     },
   };
 }
+
+// Stub bus for "gesture-disabled" subtrees. Used to isolate non-front windows from the gesture
+// stream: PinchTarget / AppFrame / any bus consumer inside such a subtree subscribes to this
+// instead of the real bus, receives nothing, and emits into a sink — so back windows can't be
+// clicked, dragged, or scrolled without first being brought to front.
+export function createStubBus(): GestureBus {
+  return {
+    subscribe() {
+      return () => {};
+    },
+    emit() {},
+  };
+}

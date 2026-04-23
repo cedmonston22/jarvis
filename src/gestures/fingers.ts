@@ -80,6 +80,27 @@ export function fingerStraightness(hand: Hand, fingerIdx: 0 | 1 | 2 | 3 | 4): nu
   return (v1x * v2x + v1y * v2y + v1z * v2z) / (mag1 * mag2);
 }
 
+// 3D Euclidean distance from MCP (knuckle) to TIP, normalized by the MCP→PIP segment length.
+// Extended finger ≈ 3 (tip is ~three bone-lengths from knuckle); tightly curled finger ≈ 1 (tip
+// folds back near the knuckle). Orientation-invariant — the metric holds up when the finger is
+// foreshortened in 2D (palm facing the camera), which is exactly the case where straightness-
+// based angle cosines get unreliable. Used alongside `fingerStraightness2D` in the pointer-pose
+// check as an AND gate so a foreshortened, noisy-2D finger can't spuriously read "extended".
+//
+// Not for pinch detection — that was tried and rejected (real deliberate pinches where the index
+// curls inward fell below a reach threshold). Here it's an AND with 2D, so pinch-time noise is
+// immaterial.
+export function fingerReach(hand: Hand, fingerIdx: 0 | 1 | 2 | 3 | 4): number {
+  const { base, mid, tip } = FINGER_CHAINS[fingerIdx];
+  const b = hand[base];
+  const m = hand[mid];
+  const t = hand[tip];
+  const segLen = Math.hypot(m.x - b.x, m.y - b.y, m.z - b.z);
+  if (segLen === 0) return 0;
+  const tipDist = Math.hypot(t.x - b.x, t.y - b.y, t.z - b.z);
+  return tipDist / segLen;
+}
+
 // 2D-only variant, ignoring the z-axis. MediaPipe's z estimation degrades when the hand is small
 // in the frame (far from camera), but x/y stay accurate. Used by click detection where the curl
 // motion happens in the image plane anyway — more robust at distance.
